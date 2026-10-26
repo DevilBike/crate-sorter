@@ -101,7 +101,7 @@ const REDIRECT = location.origin + location.pathname;
 const API = 'https://api.spotify.com/v1';
 const MIN_GAP = 600; // ms between Spotify requests. Slow on purpose: fewer bursts, fewer 429s.
 const IN_PREVIEW = (() => { try { return window.self !== window.top; } catch { return true; } })();
-const APP_VERSION = '2026-10-26.12';
+const APP_VERSION = '2026-10-26.13';
 try { localStorage.removeItem('cs.genres'); } catch {}
 
 // Ten buckets. kw = words matched against artist genres, title = words matched against song/album names.
@@ -465,21 +465,33 @@ function splitByDecade(b, minPart = 20) {
   return parts;
 }
 
-function buildPlan(lib, { unsortedToPop, off, split, splitAt, skipSrc }) {
+// Your hand-sorting wins: a choice for a song beats one for its artist, and both beat the automatic sort.
+// 'skip' leaves the song out. A choice pointing at a playlist you switched off falls back to the automatic sort.
+function manualFor(t, manual) {
+  const m = manual?.songs?.[t.id];
+  if (m) return { key: m, by: 'song' };
+  const a = t.artists[0] && manual?.artists?.[t.artists[0].id];
+  return a ? { key: a, by: 'artist' } : null;
+}
+function buildPlan(lib, { unsortedToPop, off, split, splitAt, skipSrc, manual }) {
   const buckets = BUCKETS.map(b => ({ ...b, tracks: [] }));
-  const unsorted = []; let viaGenre = 0;
+  const unsorted = [], skipped = []; let viaGenre = 0, byHand = 0;
+  const where = new Map(); // song id → { key, by }
   const chosen = lib.tracks.filter(t => !t.src || t.src.some(s => !skipSrc.has(s)));
   for (const t of chosen) {
+    const m = manualFor(t, manual);
+    if (m && m.key === 'skip') { skipped.push(t); byHand++; where.set(t.id, m); continue; }
+    if (m && !off.has(m.key)) { const i = BUCKETS.findIndex(b => b.key === m.key); if (i >= 0) { buckets[i].tracks.push(t); byHand++; where.set(t.id, m); continue; } }
     const r = classify(t, lib.genres);
     // A song whose best match is switched off goes to its next-best match that is still on.
     const idx = r.ranked.find(i => !off.has(BUCKETS[i].key));
-    if (idx !== undefined) { buckets[idx].tracks.push(t); if (r.via === 'genre') viaGenre++; }
-    else if (unsortedToPop && !off.has('pop')) buckets[POP].tracks.push(t);
-    else unsorted.push(t);
+    if (idx !== undefined) { buckets[idx].tracks.push(t); if (r.via === 'genre') viaGenre++; where.set(t.id, { key: BUCKETS[idx].key, by: 'auto' }); }
+    else if (unsortedToPop && !off.has('pop')) { buckets[POP].tracks.push(t); where.set(t.id, { key: 'pop', by: 'none' }); }
+    else { unsorted.push(t); where.set(t.id, { key: null, by: 'none' }); }
   }
   const final = buckets.filter(b => !off.has(b.key) && b.tracks.length)
     .flatMap(b => split && b.tracks.length > splitAt ? splitByDecade(b) : [b]);
-  return { buckets, final, unsorted, viaGenre, chosen: chosen.length };
+  return { buckets, final, unsorted, skipped, viaGenre, byHand, where, chosenTracks: chosen, chosen: chosen.length - skipped.length };
 }
 
 /* ---------- Automation and undo ---------- */
@@ -716,6 +728,8 @@ function App() {
     store.set('cs.srcKnown', [...known, ...fresh.map(p => p.id)]);
   }, [lib]);
   const [unlike, setUnlike] = useState(() => store.get('cs.unlike'));
+  const [manual, setManual] = useState(() => store.get('cs.manual', { songs: {}, artists: {} }));
+  useEffect(() => { store.set('cs.manual', manual); }, [manual]);
   const [askRescan, setAskRescan] = useState(false);
   const splitAt = 150;
   const [runKind, setRunKind] = useState('');
@@ -752,7 +766,7 @@ function App() {
     const until = new Date(Date.now() + s * 1000).toLocaleTimeString([], { hour: '2-digit', minute: '2-digit', second: '2-digit' });
     push(`${why === 'limit' ? 'Spotify asked us to slow down' : why === 'saved' ? 'Still inside the wait Spotify asked for' : 'Connection dropped (often a rate limit)'}. Waiting ${s >= 120 ? Math.round(s / 60) + ' min' : s + 's'}, until ${until}, then carrying on. Keep this page open.`, 'err');
   }), [clientId]);
-  const plan = useMemo(() => lib && buildPlan(lib, { unsortedToPop, off, split, splitAt, skipSrc }), [lib, unsortedToPop, off, split, skipSrc]);
+  const plan = useMemo(() => lib && buildPlan(lib, { unsortedToPop, off, split, splitAt, skipSrc, manual }), [lib, unsortedToPop, off, split, skipSrc, manual]);
   useEffect(() => { store.set('cs.off', [...off]); store.set('cs.split', split); }, [off, split]);
 
   useEffect(() => { store.set('cs.clientId', clientId.trim()); }, [clientId]);
@@ -873,6 +887,7 @@ function App() {
       `Settings: dryRun=${dry} genres=${lookupGenres} ownPlaylists=${includeOwn} split=${split} unsortedToPop=${unsortedToPop} off=[${[...off].join(',')}]`,
       `Saved library: ${saved ? `${saved.tracks.length} songs, ${saved.playlists.length} playlists, read ${new Date(saved.at).toISOString()}, format ${saved.v || 1}` : 'none'}`,
       `Sources skipped: ${skipSrc.size ? [...skipSrc].join(',') : 'none'}`,
+      `Hand-sorted: ${Object.keys(manual.songs).length} songs, ${Object.keys(manual.artists).length} artists set; ${plan ? `${plan.byHand} songs placed by hand, ${plan.skipped.length} left out` : 'no plan'}`,
       `Liked Songs clearing: ${unlike ? `backup ${unlike.added}/${unlike.backup.length}${unlike.verified ? ' checked' : ''}, removed ${unlike.removed}/${unlike.remove.length}, restored ${unlike.restored || 0}${unlike.demo ? ' (demo)' : ''}` : 'none'}`,
       `MusicBrainz genres saved: ${Object.keys(g).length} (${Object.values(g).filter(v => !v.length).length} with no genres)`,
       `Pace: ${Math.round(store.get('cs.gap', MIN_GAP))}ms between requests · Wait until: ${bu > Date.now() ? new Date(bu).toISOString() : 'none'}`,
@@ -893,7 +908,7 @@ function App() {
         <div className="flex items-center gap-2">
           <span className="grid h-9 w-9 place-items-center rounded-xl bg-accent text-accent-fg"><Icon name="list" className="w-5 h-5" /></span>
           <span className="font-display text-xl font-bold tracking-tight">Crate Sorter</span>
-          <span className="rounded-full border border-line px-2 py-0.5 text-xs text-muted num" title="Version">{NATIVE?.appVersion ? 'v' + NATIVE.appVersion() : 'web ' + APP_VERSION}</span>
+          <span className="whitespace-nowrap rounded-full border border-line px-2 py-0.5 text-xs text-muted num" title="Version">{NATIVE?.appVersion ? 'v' + NATIVE.appVersion() : 'web ' + APP_VERSION}</span>
         </div>
         {lib && (
           <div className="flex items-center gap-2 text-sm">
@@ -1000,7 +1015,9 @@ function App() {
           </div>
           <p className="text-sm text-muted -mt-1 num">
             {lib.tracks.length ? Math.round(plan.viaGenre / lib.tracks.length * 100) : 0}% sorted by genre, the rest by song names and release year.
+            {plan.byHand > 0 && ` ${plural(plan.byHand, 'song')} sorted by you${plan.skipped.length ? `, ${plan.skipped.length} left out` : ''}.`}
           </p>
+          <Btn kind="ghost" onClick={() => { setView('sorter'); window.scrollTo(0, 0); }} className="w-full"><Icon name="list" />Sort by hand{plan.byHand ? ` (${plan.byHand.toLocaleString()} so far)` : ''}</Btn>
           {!demo && lib.at && (
             <div className="flex items-center justify-between gap-3 text-sm text-muted -mt-1">
               <span>Library saved {new Date(lib.at).toLocaleString([], { dateStyle: 'medium', timeStyle: 'short' })}. Reopening the app uses this copy.</span>
@@ -1085,6 +1102,10 @@ function App() {
         </>
       )}
 
+      {view === 'sorter' && plan && (
+        <HandSorter plan={plan} off={off} manual={manual} setManual={setManual} onDone={() => { setView('dashboard'); window.scrollTo(0, 0); }} />
+      )}
+
       {view === 'running' && (
         <Panel className="flex flex-col gap-3">
           <div className="flex items-center justify-between gap-2">
@@ -1134,6 +1155,157 @@ function App() {
         </Panel>
       )}
       <TroublePanel report={report} />
+    </div>
+  );
+}
+
+// Sort songs or whole artists by hand. Pick a playlist at the top, then tap songs to drop them in;
+// or tap a song with nothing picked to choose for just that one.
+function HandSorter({ plan, off, manual, setManual, onDone }) {
+  const [mode, setMode] = useState('songs');
+  const [q, setQ] = useState('');
+  const [show, setShow] = useState('all');
+  const [brush, setBrush] = useState(null);
+  const [open, setOpen] = useState(null);
+  const [limit, setLimit] = useState(60);
+  const [confirmReset, setConfirmReset] = useState(false);
+  useEffect(() => setLimit(60), [mode, q, show]);
+  const targets = [...BUCKETS.filter(b => !off.has(b.key)).map(b => ({ key: b.key, name: b.name, hue: b.hue })), { key: 'skip', name: 'Leave out', hue: null }];
+  const nameOf = k => k === 'skip' ? 'Left out' : BUCKETS.find(b => b.key === k)?.name || 'Not sorted';
+  const hueOf = k => BUCKETS.find(b => b.key === k)?.hue;
+  const set = (kind, id, key) => setManual(m => {
+    const next = { songs: { ...m.songs }, artists: { ...m.artists } };
+    if (key == null) delete next[kind][id]; else next[kind][id] = key;
+    return next;
+  });
+  const needle = q.trim().toLowerCase();
+
+  const songs = useMemo(() => plan.chosenTracks.map(t => ({ t, w: plan.where.get(t.id) || { key: null, by: 'none' } })), [plan]);
+  const artists = useMemo(() => {
+    const m = new Map();
+    for (const { t, w } of songs) {
+      const a = t.artists[0]; if (!a) continue;
+      const e = m.get(a.id) || { id: a.id, name: a.name, n: 0, keys: {}, own: 0 };
+      e.n++; if (w.key) e.keys[w.key] = (e.keys[w.key] || 0) + 1; if (w.by === 'song') e.own++;
+      m.set(a.id, e);
+    }
+    return [...m.values()].map(e => ({ ...e, top: Object.entries(e.keys).sort((x, y) => y[1] - x[1])[0]?.[0] || null })).sort((x, y) => y.n - x.n || x.name.localeCompare(y.name));
+  }, [songs]);
+
+  const list = mode === 'songs'
+    ? songs.filter(({ t, w }) => (!needle || (t.name + ' ' + t.artists.map(a => a.name).join(' ') + ' ' + t.album).toLowerCase().includes(needle))
+        && (show === 'all' || (show === 'hand' ? w.by === 'song' || w.by === 'artist' : show === 'auto' ? w.by === 'auto' || w.by === 'none' : w.by === 'none')))
+    : artists.filter(a => (!needle || a.name.toLowerCase().includes(needle))
+        && (show === 'all' || (show === 'hand' ? !!manual.artists[a.id] : show === 'auto' ? !manual.artists[a.id] : !a.top)));
+  const handCount = Object.keys(manual.songs).length + Object.keys(manual.artists).length;
+
+  const Chips = ({ current, onPick }) => (
+    <div className="flex flex-wrap gap-1.5 pt-2">
+      {targets.map(b => (
+        <button key={b.key} onClick={() => onPick(b.key)}
+          className={'flex items-center gap-1.5 rounded-full border px-3 py-1.5 text-sm ' + (current === b.key ? 'border-accent text-accent font-semibold' : 'border-line')}>
+          {b.hue != null ? <span className="h-2.5 w-2.5 rounded-full" style={{ background: dot(b.hue) }} /> : <Icon name="x" className="w-3.5 h-3.5" />}{b.name}
+        </button>
+      ))}
+      {current && <button onClick={() => onPick(null)} className="rounded-full border border-line px-3 py-1.5 text-sm text-muted">Back to automatic</button>}
+    </div>
+  );
+  const Badge = ({ k, by }) => (
+    <span className="flex shrink-0 items-center gap-1 text-xs">
+      {hueOf(k) != null && <span className="h-2.5 w-2.5 rounded-full" style={{ background: dot(hueOf(k)) }} />}
+      <span className={by === 'song' || by === 'artist' ? 'font-semibold' : 'text-muted'}>{nameOf(k)}</span>
+      {(by === 'song' || by === 'artist') && <span className="rounded border border-accent px-1 text-[10px] text-accent">{by === 'song' ? 'you' : 'artist'}</span>}
+    </span>
+  );
+
+  function tapSong(t, w) {
+    if (brush) set('songs', t.id, manual.songs[t.id] === brush ? null : brush);
+    else setOpen(open === t.id ? null : t.id);
+  }
+  function tapArtist(a) {
+    if (brush) set('artists', a.id, manual.artists[a.id] === brush ? null : brush);
+    else setOpen(open === a.id ? null : a.id);
+  }
+
+  return (
+    <div className="flex flex-col gap-3">
+      <div className="sticky top-0 z-10 -mx-4 flex flex-col gap-2 border-b border-line bg-bg px-4 pb-3 pt-2">
+        <div className="flex items-center justify-between gap-2">
+          <h2 className="text-lg font-bold">Sort by hand</h2>
+          <Btn onClick={onDone} className="py-2 px-4"><Icon name="check" />Done</Btn>
+        </div>
+        <div className="grid grid-cols-2 gap-1 rounded-xl border border-line p-1 text-sm">
+          {[['songs', 'Songs'], ['artists', 'Artists']].map(([k, l]) => (
+            <button key={k} onClick={() => { setMode(k); setOpen(null); }} className={'rounded-lg py-1.5 ' + (mode === k ? 'bg-accent text-accent-fg font-semibold' : '')}>{l}</button>
+          ))}
+        </div>
+        <input type="search" value={q} onChange={e => setQ(e.target.value)} placeholder={mode === 'songs' ? 'Search songs, artists, albums' : 'Search artists'}
+          className="rounded-lg border border-line bg-surface px-3 py-2 text-base" aria-label="Search" />
+        <div className="flex gap-1.5 overflow-x-auto text-xs">
+          {[['all', 'All'], ['auto', 'Automatic'], ['hand', 'Set by you'], ['none', 'No match']].map(([k, l]) => (
+            <button key={k} onClick={() => setShow(k)} className={'shrink-0 rounded-full border px-3 py-1 ' + (show === k ? 'border-accent text-accent font-semibold' : 'border-line text-muted')}>{l}</button>
+          ))}
+        </div>
+        <div>
+          <p className="text-xs text-muted">{brush ? <>Tap {mode} to put them in <strong className="text-fg">{nameOf(brush)}</strong>. Tap again to undo.</> : <>Pick a playlist, then tap {mode} to drop them in. Or tap one {mode === 'songs' ? 'song' : 'artist'} to choose just for it.</>}</p>
+          <div className="mt-1 flex gap-1.5 overflow-x-auto pb-1">
+            {targets.map(b => (
+              <button key={b.key} onClick={() => setBrush(brush === b.key ? null : b.key)}
+                className={'flex shrink-0 items-center gap-1.5 rounded-full border px-3 py-1.5 text-sm ' + (brush === b.key ? 'border-accent bg-accent text-accent-fg font-semibold' : 'border-line bg-surface')}>
+                {b.hue != null ? <span className="h-2.5 w-2.5 rounded-full" style={{ background: dot(b.hue) }} /> : <Icon name="x" className="w-3.5 h-3.5" />}{b.name}
+              </button>
+            ))}
+          </div>
+        </div>
+      </div>
+
+      <p className="text-xs text-muted num">
+        {plural(list.length, mode === 'songs' ? 'song' : 'artist')} shown. Your choice for a song beats your choice for its artist, and both beat the automatic sort.
+      </p>
+
+      <ul className="flex flex-col divide-y divide-[var(--line)] rounded-xl border border-line bg-surface">
+        {list.slice(0, limit).map(item => mode === 'songs' ? (() => {
+          const { t, w } = item;
+          return (
+            <li key={t.id} className="px-3 py-2">
+              <button className="flex w-full items-center gap-3 text-left" onClick={() => tapSong(t, w)} aria-expanded={open === t.id}>
+                <span className="min-w-0 flex-1">
+                  <span className="block truncate text-sm font-medium">{t.name}</span>
+                  <span className="block truncate text-xs text-muted">{t.artists.map(a => a.name).join(', ')}{t.year ? ` · ${t.year}` : ''}</span>
+                </span>
+                <Badge k={w.key} by={w.by} />
+              </button>
+              {open === t.id && !brush && <Chips current={manual.songs[t.id]} onPick={k => { set('songs', t.id, k); setOpen(null); }} />}
+            </li>
+          );
+        })() : (
+          <li key={item.id} className="px-3 py-2">
+            <button className="flex w-full items-center gap-3 text-left" onClick={() => tapArtist(item)} aria-expanded={open === item.id}>
+              <span className="min-w-0 flex-1">
+                <span className="block truncate text-sm font-medium">{item.name}</span>
+                <span className="block truncate text-xs text-muted num">{plural(item.n, 'song')}{item.own ? ` · ${item.own} set one by one` : ''}</span>
+              </span>
+              <Badge k={manual.artists[item.id] || item.top} by={manual.artists[item.id] ? 'artist' : 'auto'} />
+            </button>
+            {open === item.id && !brush && <Chips current={manual.artists[item.id]} onPick={k => { set('artists', item.id, k); setOpen(null); }} />}
+          </li>
+        ))}
+        {!list.length && <li className="px-3 py-6 text-center text-sm text-muted">Nothing matches.</li>}
+      </ul>
+      {list.length > limit && <Btn kind="ghost" onClick={() => setLimit(l => l + 100)}>Show more ({(list.length - limit).toLocaleString()} left)</Btn>}
+
+      {handCount > 0 && (confirmReset ? (
+        <Notice tone="warn" icon="alert">
+          <strong className="block">Clear all {handCount} of your choices?</strong>
+          <span className="block mb-2">Every song goes back to the automatic sort.</span>
+          <div className="grid grid-cols-2 gap-2">
+            <Btn kind="ghost" className="py-2" onClick={() => setConfirmReset(false)}>Cancel</Btn>
+            <Btn kind="danger" className="py-2" onClick={() => { setManual({ songs: {}, artists: {} }); setConfirmReset(false); }}>Clear them</Btn>
+          </div>
+        </Notice>
+      ) : (
+        <button className="text-sm text-muted underline self-center" onClick={() => setConfirmReset(true)}>Clear all my choices ({handCount})</button>
+      ))}
     </div>
   );
 }
