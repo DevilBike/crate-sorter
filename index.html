@@ -100,7 +100,7 @@ const REDIRECT = location.origin + location.pathname;
 const API = 'https://api.spotify.com/v1';
 const MIN_GAP = 600; // ms between Spotify requests. Slow on purpose: fewer bursts, fewer 429s.
 const IN_PREVIEW = (() => { try { return window.self !== window.top; } catch { return true; } })();
-const APP_VERSION = '2026-10-26.8';
+const APP_VERSION = '2026-10-26.9';
 try { localStorage.removeItem('cs.genres'); } catch {}
 
 // Ten buckets. kw = words matched against artist genres, title = words matched against song/album names.
@@ -217,6 +217,13 @@ const keepAlive = (() => {
 const esc = s => s.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
 const wordRe = {};
 const matchWord = (text, k) => (wordRe[k] ||= new RegExp('(^|[\\s\\-/(])' + esc(k) + '($|[\\s\\-/)])')).test(text);
+// fetch that gives up after `ms`, so a request stuck while the phone was asleep is retried instead of hanging.
+function fetchWithTimeout(url, opts = {}, ms = 30000) {
+  const ctrl = new AbortController();
+  let done = false;
+  sleep(ms).then(() => { if (!done) ctrl.abort(); });
+  return fetch(url, { ...opts, signal: ctrl.signal }).finally(() => { done = true; });
+}
 const plural = (n, w) => `${n.toLocaleString()} ${w}${n === 1 ? '' : 's'}`;
 
 /* ---------- Spotify auth: Authorization Code with PKCE (Implicit Grant was removed in Nov 2025) ---------- */
@@ -288,10 +295,11 @@ function makeApi(clientId, onWait) {
     const label = `${method} ${shortPath(url)}${body?.uris ? ` (${body.uris.length} uris)` : ''}`;
     let r;
     try {
-      r = await fetch(url, { method, body: body ? JSON.stringify(body) : undefined,
+      r = await fetchWithTimeout(url, { method, body: body ? JSON.stringify(body) : undefined,
         headers: { Authorization: 'Bearer ' + await token(), ...(body ? { 'Content-Type': 'application/json' } : {}) } });
     } catch (e) {
-      debug.add('NET', `${label} → no response (${e.message}) try ${tries + 1}`);
+      debug.add('NET', `${label} → no response (${e.name === 'AbortError' ? 'timed out' : e.message}) try ${tries + 1}`);
+      if (e.name === 'AbortError' && tries < 3) { await sleep(3000); return send(method, path, body, tries + 1); }
       // A rate-limited reply sometimes arrives without CORS headers, which the browser reports as a network error.
       if (tries < 8) { await backoff(Math.min(30 * 2 ** tries, 600), 'network'); return send(method, path, body, tries + 1); }
       throw new Error('Could not reach Spotify. Check your connection and try again.');
@@ -337,7 +345,7 @@ async function musicBrainzGenres(name, tries = 0) {
   mbLast = Date.now();
   const url = 'https://musicbrainz.org/ws/2/artist/?fmt=json&limit=3&query=' + encodeURIComponent(`artist:"${name.replace(/"/g, '')}"`);
   let r;
-  try { r = await fetch(url, { headers: { Accept: 'application/json' } }); }
+  try { r = await fetchWithTimeout(url, { headers: { Accept: 'application/json' } }, 20000); }
   catch (e) { debug.add('MB', `"${name}" → no response (${e.message})`); if (tries < 2) { await sleep(5000); return musicBrainzGenres(name, tries + 1); } return null; }
   debug.add('MB', `"${name}" → ${r.status} ${Date.now() - mbLast}ms`);
   if (r.status === 503 || r.status === 429) {

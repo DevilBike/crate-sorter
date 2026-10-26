@@ -14,6 +14,8 @@ import android.os.Handler
 import android.os.Looper
 import android.os.PowerManager
 import android.provider.Settings
+import android.content.Context
+import android.view.View
 import android.view.WindowInsets
 import android.webkit.JavascriptInterface
 import android.webkit.WebResourceRequest
@@ -23,13 +25,13 @@ import android.webkit.WebViewClient
 // Shows the hosted web app in a WebView and gives it a native bridge, so its work can keep
 // running in a foreground service while the phone is locked, without playing any audio.
 class MainActivity : Activity() {
-    private lateinit var web: WebView
+    private lateinit var web: KeepAliveWebView
     private val handler = Handler(Looper.getMainLooper())
 
     @SuppressLint("SetJavaScriptEnabled")
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
-        web = WebView(this)
+        web = KeepAliveWebView(this)
         setContentView(web)
 
         web.settings.javaScriptEnabled = true
@@ -94,7 +96,16 @@ class MainActivity : Activity() {
 
         @JavascriptInterface
         fun setWorking(on: Boolean) {
-            handler.post { if (on) startWork() else stopService(Intent(this@MainActivity, WorkService::class.java)) }
+            handler.post {
+                web.keepVisible = on
+                if (on) {
+                    web.onResume()
+                    web.resumeTimers()
+                    startWork()
+                } else {
+                    stopService(Intent(this@MainActivity, WorkService::class.java))
+                }
+            }
         }
 
         @JavascriptInterface
@@ -120,5 +131,15 @@ class MainActivity : Activity() {
 
     companion object {
         const val START_URL = "https://devilbike.github.io/crate-sorter/"
+    }
+}
+
+// When the app goes to the background, WebView tells the page it is hidden, and Chromium then
+// throttles and soon freezes it. While work is running, keep reporting the window as visible.
+class KeepAliveWebView(context: Context) : WebView(context) {
+    var keepVisible = false
+
+    override fun onWindowVisibilityChanged(visibility: Int) {
+        super.onWindowVisibilityChanged(if (keepVisible && visibility != View.VISIBLE) View.VISIBLE else visibility)
     }
 }
