@@ -100,6 +100,7 @@ const REDIRECT = location.origin + location.pathname;
 const API = 'https://api.spotify.com/v1';
 const MIN_GAP = 600; // ms between Spotify requests. Slow on purpose: fewer bursts, fewer 429s.
 const IN_PREVIEW = (() => { try { return window.self !== window.top; } catch { return true; } })();
+const APP_VERSION = '2026-10-26.4';
 
 // Ten buckets. kw = words matched against artist genres, title = words matched against song/album names.
 const BUCKETS = [
@@ -145,6 +146,25 @@ const store = {
   set(k, v) { try { localStorage.setItem(k, JSON.stringify(v)); } catch {} },
   del(k) { try { localStorage.removeItem(k); } catch {} },
 };
+// Troubleshooting log: the last 2,000 events, kept in this browser only. Tokens and the Client ID are never recorded.
+const debug = (() => {
+  let buf = store.get('cs.debug', []), timer = null;
+  const flush = () => { timer = null; store.set('cs.debug', buf); };
+  return {
+    add(kind, text) {
+      buf.push(new Date().toISOString().replace('T', ' ').slice(0, 23) + ' ' + kind.padEnd(5) + ' ' + text);
+      if (buf.length > 2000) buf = buf.slice(-2000);
+      if (!timer) timer = setTimeout(flush, 1000);
+    },
+    lines: () => buf,
+    clear() { buf = []; flush(); },
+  };
+})();
+const shortPath = url => url.replace('https://api.spotify.com/v1', '').replace(/\/[A-Za-z0-9]{22}(?=\/|\?|$)/g, '/{id}');
+window.addEventListener('error', e => debug.add('JS', `${e.message} at ${e.filename?.split('/').pop()}:${e.lineno}`));
+window.addEventListener('unhandledrejection', e => debug.add('JS', 'Unhandled: ' + (e.reason?.message || e.reason)));
+document.addEventListener('visibilitychange', () => debug.add('PAGE', document.hidden ? 'went to background' : 'back in front'));
+
 const esc = s => s.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
 const wordRe = {};
 const matchWord = (text, k) => (wordRe[k] ||= new RegExp('(^|[\\s\\-/(])' + esc(k) + '($|[\\s\\-/)])')).test(text);
@@ -165,6 +185,7 @@ async function tokenRequest(params) {
   const r = await fetch('https://accounts.spotify.com/api/token', { method: 'POST',
     headers: { 'Content-Type': 'application/x-www-form-urlencoded' }, body: new URLSearchParams(params) });
   const j = await r.json().catch(() => ({}));
+  debug.add('AUTH', `${params.grant_type} → ${r.status}${r.ok ? '' : ' ' + (j.error || '') + ' ' + (j.error_description || '')}`);
   if (!r.ok) throw new Error(j.error_description || j.error || `Spotify refused the sign-in (${r.status}).`);
   const tok = { access: j.access_token, refresh: j.refresh_token || store.get('cs.tok')?.refresh, exp: Date.now() + (j.expires_in - 60) * 1000 };
   store.set('cs.tok', tok);
@@ -184,7 +205,8 @@ async function finishLogin(clientId) {
 
 /* ---------- API client: one request at a time, paced, and it never gives up on a 429 ---------- */
 function makeApi(clientId, onWait) {
-  let gap = MIN_GAP, last = 0;
+  // The pace and any "wait until" time are saved, so reloading the page during a block can't send requests early.
+  let gap = Math.max(MIN_GAP, store.get('cs.gap', MIN_GAP)), last = 0;
   async function token() {
     let t = store.get('cs.tok');
     if (!t) throw new Error('You are not signed in.');
@@ -195,7 +217,8 @@ function makeApi(clientId, onWait) {
     return t.access;
   }
   async function backoff(seconds, why) {
-    gap = Math.min(gap * 2, 10000); // stay slower for the rest of the session
+    gap = Math.min(gap * 2, 10000); store.set('cs.gap', gap); // stay slower afterwards
+    store.set('cs.blockedUntil', Date.now() + seconds * 1000 + 500);
     await onWait?.(seconds, why);
     await sleep(seconds * 1000 + 500);
   }
@@ -207,19 +230,24 @@ function makeApi(clientId, onWait) {
     return run;
   }
   async function send(method, path, body, tries) {
+    const blocked = store.get('cs.blockedUntil', 0) - Date.now();
+    if (blocked > 0) { await onWait?.(Math.ceil(blocked / 1000), 'saved'); await sleep(blocked); }
     const wait = last + gap - Date.now();
     if (wait > 0) await sleep(wait);
     last = Date.now();
     const url = path.startsWith('http') ? path : API + path;
+    const label = `${method} ${shortPath(url)}${body?.uris ? ` (${body.uris.length} uris)` : ''}`;
     let r;
     try {
       r = await fetch(url, { method, body: body ? JSON.stringify(body) : undefined,
         headers: { Authorization: 'Bearer ' + await token(), ...(body ? { 'Content-Type': 'application/json' } : {}) } });
     } catch (e) {
+      debug.add('NET', `${label} → no response (${e.message}) try ${tries + 1}`);
       // A rate-limited reply sometimes arrives without CORS headers, which the browser reports as a network error.
       if (tries < 8) { await backoff(Math.min(30 * 2 ** tries, 600), 'network'); return send(method, path, body, tries + 1); }
       throw new Error('Could not reach Spotify. Check your connection and try again.');
     }
+    debug.add('REQ', `${label} → ${r.status} ${Date.now() - last}ms gap=${Math.round(gap)}ms${r.headers.get('Retry-After') ? ' retry-after=' + r.headers.get('Retry-After') : ''}${tries ? ' try ' + (tries + 1) : ''}`);
     if (r.status === 429) {
       await backoff(Number(r.headers.get('Retry-After')) || Math.min(30 * 2 ** Math.min(tries, 4), 600), 'limit');
       return send(method, path, body, tries + 1);
@@ -229,10 +257,11 @@ function makeApi(clientId, onWait) {
     const txt = await r.text();
     let j = null; try { j = txt ? JSON.parse(txt) : null; } catch {}
     if (!r.ok) {
+      debug.add('ERR', `${label} body: ${txt.slice(0, 300)}`);
       const e = new Error(`${method} ${url.replace(API, '').split('?')[0]} failed (${r.status}): ${j?.error?.message || txt || r.statusText}`);
       e.status = r.status; throw e;
     }
-    gap = Math.max(MIN_GAP, gap * 0.97);
+    gap = Math.max(MIN_GAP, gap * 0.97); store.set('cs.gap', gap);
     return j;
   }
   async function all(path, onPage) {
@@ -513,14 +542,14 @@ function App() {
   const [runKind, setRunKind] = useState('');
   const [busy, setBusy] = useState(false);
 
-  const push = (msg, tone, replaceLast) => setLines(ls => {
+  const push = (msg, tone, replaceLast) => { if (!replaceLast) debug.add(tone === 'err' ? 'WARN' : 'LOG', msg); setLines(ls => {
     const t = new Date().toLocaleTimeString([], { hour: '2-digit', minute: '2-digit', second: '2-digit' });
     const next = replaceLast && ls.length && ls[ls.length - 1].live ? ls.slice(0, -1) : ls;
     return [...next, { t, msg, tone, live: replaceLast }];
-  });
+  }); };
   const api = useMemo(() => makeApi(clientId.trim(), (s, why) => {
     const until = new Date(Date.now() + s * 1000).toLocaleTimeString([], { hour: '2-digit', minute: '2-digit', second: '2-digit' });
-    push(`${why === 'limit' ? 'Spotify asked us to slow down' : 'Connection dropped (often a rate limit)'}. Waiting ${s >= 120 ? Math.round(s / 60) + ' min' : s + 's'}, until ${until}, then carrying on. Keep this page open.`, 'err');
+    push(`${why === 'limit' ? 'Spotify asked us to slow down' : why === 'saved' ? 'Still inside the wait Spotify asked for' : 'Connection dropped (often a rate limit)'}. Waiting ${s >= 120 ? Math.round(s / 60) + ' min' : s + 's'}, until ${until}, then carrying on. Keep this page open.`, 'err');
   }), [clientId]);
   const plan = useMemo(() => lib && buildPlan(lib, { unsortedToPop, off, split, splitAt }), [lib, unsortedToPop, off, split]);
   useEffect(() => { store.set('cs.off', [...off]); store.set('cs.split', split); }, [off, split]);
@@ -585,11 +614,34 @@ function App() {
     store.del('cs.journal'); setJournal(null); setBusy(false);
   }
 
+  function report() {
+    const g = store.get('cs.genres', {}), saved = store.get('cs.lib'), lines = debug.lines();
+    const statuses = {};
+    for (const l of lines) { const m = l.match(/ REQ .* → (\d{3})/); if (m) statuses[m[1]] = (statuses[m[1]] || 0) + 1; }
+    const bu = store.get('cs.blockedUntil', 0);
+    return [
+      'Crate Sorter troubleshooting log',
+      `Version ${APP_VERSION} · ${new Date().toISOString()}`,
+      `Browser: ${navigator.userAgent}`,
+      `Page: ${REDIRECT}${IN_PREVIEW ? ' (preview frame)' : ''} · Client ID set: ${clientId.trim() ? 'yes' : 'no'} · Signed in: ${store.get('cs.tok') ? 'yes' : 'no'}`,
+      `View: ${view} · Busy: ${busy} · Demo: ${demo}`,
+      `Settings: dryRun=${dry} genres=${lookupGenres} ownPlaylists=${includeOwn} split=${split} unsortedToPop=${unsortedToPop} off=[${[...off].join(',')}]`,
+      `Saved library: ${saved ? `${saved.tracks.length} songs, ${saved.playlists.length} playlists, read ${new Date(saved.at).toISOString()}` : 'none'}`,
+      `Artist genres saved: ${Object.keys(g).length} (${Object.values(g).filter(v => !v.length).length} with no genres)`,
+      `Pace: ${Math.round(store.get('cs.gap', MIN_GAP))}ms between requests · Wait until: ${bu > Date.now() ? new Date(bu).toISOString() : 'none'}`,
+      plan ? `Plan: ${plan.final.map(b => `${b.name}=${b.tracks.length}`).join(', ')} · unsorted=${plan.unsorted.length} · byGenre=${plan.viaGenre}` : 'Plan: none',
+      journal ? `Last run: ${journal.finished ? 'finished' : 'NOT finished'}, started ${journal.at}${journal.demo ? ' (demo)' : ''} · ${journal.created.map(c => `${c.name} ${c.added ?? '?'} added`).join(', ') || 'nothing created'}` : 'Last run: none',
+      `Responses by status: ${Object.entries(statuses).map(([k, v]) => `${k}×${v}`).join(' ') || 'none'}`,
+      `--- last ${lines.length} events, oldest first ---`,
+      ...lines,
+    ].join('\n');
+  }
+
   const hasUndo = journal && journal.created && journal.created.length > 0;
   const canResume = journal && !journal.finished && !!journal.demo === demo;
 
   return (
-    <div className="mx-auto max-w-xl pt-4 pb-32 flex flex-col gap-4">
+    <div className="mx-auto max-w-xl pt-4 pb-48 flex flex-col gap-4">
       <header className="flex items-center justify-between gap-3">
         <div className="flex items-center gap-2">
           <span className="grid h-9 w-9 place-items-center rounded-xl bg-accent text-accent-fg"><Icon name="list" className="w-5 h-5" /></span>
@@ -786,7 +838,30 @@ function App() {
           )}
         </Panel>
       )}
+      <TroublePanel report={report} />
     </div>
+  );
+}
+
+function TroublePanel({ report }) {
+  const [text, setText] = useState('');
+  const [msg, setMsg] = useState('');
+  const refresh = () => { const t = report(); setText(t); return t; };
+  return (
+    <details className="rounded-2xl border border-line bg-surface p-4 text-sm" onToggle={e => e.currentTarget.open && refresh()}>
+      <summary className="flex items-center justify-between font-semibold">Troubleshooting log<Icon name="chevron" /></summary>
+      <div className="mt-3 flex flex-col gap-2">
+        <p className="text-muted">Every Spotify request, wait and error is recorded here. Copy it and paste it to Claude if something goes wrong. It never includes your sign-in token or Client ID.</p>
+        <div className="grid grid-cols-3 gap-2">
+          <Btn kind="primary" className="px-2 py-2" onClick={() => copyText(refresh(), setMsg)}><Icon name="copy" />Copy</Btn>
+          <Btn kind="ghost" className="px-2 py-2" onClick={refresh}>Update</Btn>
+          <Btn kind="ghost" className="px-2 py-2" onClick={() => { debug.clear(); refresh(); setMsg('Log cleared'); setTimeout(() => setMsg(''), 2000); }}>Clear</Btn>
+        </div>
+        {msg && <span className="text-xs text-muted">{msg}</span>}
+        <textarea id="debuglog" readOnly value={text} onFocus={e => e.target.select()} aria-label="Troubleshooting log"
+          className="h-56 w-full rounded-xl border border-line bg-bg p-2 font-mono text-[11px] leading-snug" />
+      </div>
+    </details>
   );
 }
 
