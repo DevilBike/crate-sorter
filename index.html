@@ -100,7 +100,7 @@ const REDIRECT = location.origin + location.pathname;
 const API = 'https://api.spotify.com/v1';
 const MIN_GAP = 600; // ms between Spotify requests. Slow on purpose: fewer bursts, fewer 429s.
 const IN_PREVIEW = (() => { try { return window.self !== window.top; } catch { return true; } })();
-const APP_VERSION = '2026-10-26.10';
+const APP_VERSION = '2026-10-26.11';
 try { localStorage.removeItem('cs.genres'); } catch {}
 
 // Ten buckets. kw = words matched against artist genres, title = words matched against song/album names.
@@ -365,25 +365,31 @@ async function musicBrainzGenres(name, tries = 0) {
 async function loadLibrary(api, { includeOwn, lookupGenres, refresh }, log) {
   let lib = refresh ? null : store.get('cs.lib');
   if (lib && lib.includeOwn !== includeOwn) lib = null;
+  if (lib && lib.v !== 2) { log('Reading your library once more to note which playlist each song came from.'); lib = null; }
   if (lib) {
     log(`Using your library saved ${new Date(lib.at).toLocaleString([], { dateStyle: 'medium', timeStyle: 'short' })} (no requests needed)`);
   } else {
     const me = await api.call('GET', '/me');
     log(`Signed in as ${me.display_name || me.id}`);
     const raw = await api.all('/me/playlists?limit=50', n => log(`Found ${plural(n, 'playlist')}`, true));
-    const playlists = raw.map(p => ({ id: p.id, name: p.name, owner: { id: p.owner?.id }, collaborative: !!p.collaborative, items: { total: p.items?.total ?? p.tracks?.total ?? 0 } }));
+    const playlists = raw.map(p => ({ id: p.id, name: p.name, owner: { id: p.owner?.id, name: p.owner?.display_name || p.owner?.id },
+      collaborative: !!p.collaborative, public: p.public, items: { total: p.items?.total ?? p.tracks?.total ?? 0 } }));
     const saved = await api.all('/me/tracks?limit=50', (n, t) => log(`Reading Liked Songs ${n}/${t}`, true));
-    let tracks = saved.map(rowTrack).filter(Boolean);
+    // Each song remembers every place it came from, so you can choose sources later without re-reading.
+    const byId = new Map();
+    const add = (rows, src) => { for (const t of rows.map(rowTrack).filter(Boolean)) { const have = byId.get(t.id); if (have) { if (!have.src.includes(src)) have.src.push(src); } else byId.set(t.id, { ...t, src: [src] }); } };
+    add(saved, 'liked');
     if (includeOwn) {
-      const own = playlists.filter(p => p.owner.id === me.id && !p.collaborative);
+      // Spotify only lets apps read the songs in playlists you own (since Feb 2026).
+      const own = playlists.filter(p => p.owner.id === me.id);
       for (const [i, p] of own.entries()) {
         log(`Reading “${p.name}” (${i + 1}/${own.length})`, true);
-        const rows = await api.all(`/playlists/${p.id}/items?limit=50`);
-        tracks.push(...rows.map(rowTrack).filter(Boolean));
+        try { add(await api.all(`/playlists/${p.id}/items?limit=50`), p.id); p.read = true; }
+        catch (e) { if (e.name === 'AbortError' || /signed in|expired|reach Spotify/i.test(e.message)) throw e; log(`Couldn't read “${p.name}” (${e.message}). Skipping it.`); }
       }
     }
-    const seen = new Set(); tracks = tracks.filter(t => !seen.has(t.id) && seen.add(t.id));
-    lib = { at: Date.now(), includeOwn, me: { id: me.id, display_name: me.display_name }, playlists, tracks };
+    const tracks = [...byId.values()];
+    lib = { v: 2, at: Date.now(), includeOwn, likedTotal: saved.length, me: { id: me.id, display_name: me.display_name }, playlists, tracks };
     store.set('cs.lib', lib);
   }
   log(`${plural(lib.tracks.length, 'unique song')} to sort`);
@@ -457,10 +463,11 @@ function splitByDecade(b, minPart = 20) {
   return parts;
 }
 
-function buildPlan(lib, { unsortedToPop, off, split, splitAt }) {
+function buildPlan(lib, { unsortedToPop, off, split, splitAt, skipSrc }) {
   const buckets = BUCKETS.map(b => ({ ...b, tracks: [] }));
   const unsorted = []; let viaGenre = 0;
-  for (const t of lib.tracks) {
+  const chosen = lib.tracks.filter(t => !t.src || t.src.some(s => !skipSrc.has(s)));
+  for (const t of chosen) {
     const r = classify(t, lib.genres);
     // A song whose best match is switched off goes to its next-best match that is still on.
     const idx = r.ranked.find(i => !off.has(BUCKETS[i].key));
@@ -470,7 +477,7 @@ function buildPlan(lib, { unsortedToPop, off, split, splitAt }) {
   }
   const final = buckets.filter(b => !off.has(b.key) && b.tracks.length)
     .flatMap(b => split && b.tracks.length > splitAt ? splitByDecade(b) : [b]);
-  return { buckets, final, unsorted, viaGenre };
+  return { buckets, final, unsorted, viaGenre, chosen: chosen.length };
 }
 
 /* ---------- Automation and undo ---------- */
@@ -630,7 +637,7 @@ async function copyText(text, setMsg) {
 function App() {
   const [view, setView] = useState('welcome');
   const [clientId, setClientId] = useState(() => store.get('cs.clientId', ''));
-  const [includeOwn, setIncludeOwn] = useState(() => store.get('cs.includeOwn', false));
+  const [includeOwn, setIncludeOwn] = useState(() => store.get('cs.includeOwn', true));
   const [lookupGenres, setLookupGenres] = useState(() => store.get('cs.lookupGenres', true));
   const [demo, setDemo] = useState(false);
   const [lib, setLib] = useState(null);
@@ -645,6 +652,8 @@ function App() {
   const [openBucket, setOpenBucket] = useState(null);
   const [off, setOff] = useState(() => new Set(store.get('cs.off', [])));
   const [split, setSplit] = useState(() => store.get('cs.split', false));
+  const [skipSrc, setSkipSrc] = useState(() => new Set(store.get('cs.skipSrc', [])));
+  useEffect(() => { store.set('cs.skipSrc', [...skipSrc]); }, [skipSrc]);
   const splitAt = 150;
   const [runKind, setRunKind] = useState('');
   const [busy, setBusy] = useState(false);
@@ -680,7 +689,7 @@ function App() {
     const until = new Date(Date.now() + s * 1000).toLocaleTimeString([], { hour: '2-digit', minute: '2-digit', second: '2-digit' });
     push(`${why === 'limit' ? 'Spotify asked us to slow down' : why === 'saved' ? 'Still inside the wait Spotify asked for' : 'Connection dropped (often a rate limit)'}. Waiting ${s >= 120 ? Math.round(s / 60) + ' min' : s + 's'}, until ${until}, then carrying on. Keep this page open.`, 'err');
   }), [clientId]);
-  const plan = useMemo(() => lib && buildPlan(lib, { unsortedToPop, off, split, splitAt }), [lib, unsortedToPop, off, split]);
+  const plan = useMemo(() => lib && buildPlan(lib, { unsortedToPop, off, split, splitAt, skipSrc }), [lib, unsortedToPop, off, split, skipSrc]);
   useEffect(() => { store.set('cs.off', [...off]); store.set('cs.split', split); }, [off, split]);
 
   useEffect(() => { store.set('cs.clientId', clientId.trim()); }, [clientId]);
@@ -755,12 +764,13 @@ function App() {
     const bu = store.get('cs.blockedUntil', 0);
     return [
       'Crate Sorter troubleshooting log',
-      `Version ${APP_VERSION} · ${new Date().toISOString()}`,
+      `Version ${APP_VERSION}${NATIVE?.appVersion ? ` · app v${NATIVE.appVersion()}` : ''} · ${new Date().toISOString()}`,
       `Browser: ${navigator.userAgent}`,
       `Page: ${REDIRECT}${IN_PREVIEW ? ' (preview frame)' : ''}${NATIVE ? ` · Android app, battery ${NATIVE.batteryUnrestricted() ? 'unrestricted' : 'optimized'}` : ''} · Client ID set: ${clientId.trim() ? 'yes' : 'no'} · Signed in: ${store.get('cs.tok') ? 'yes' : 'no'}`,
       `View: ${view} · Busy: ${busy} · Demo: ${demo}`,
       `Settings: dryRun=${dry} genres=${lookupGenres} ownPlaylists=${includeOwn} split=${split} unsortedToPop=${unsortedToPop} off=[${[...off].join(',')}]`,
-      `Saved library: ${saved ? `${saved.tracks.length} songs, ${saved.playlists.length} playlists, read ${new Date(saved.at).toISOString()}` : 'none'}`,
+      `Saved library: ${saved ? `${saved.tracks.length} songs, ${saved.playlists.length} playlists, read ${new Date(saved.at).toISOString()}, format ${saved.v || 1}` : 'none'}`,
+      `Sources skipped: ${skipSrc.size ? [...skipSrc].join(',') : 'none'}`,
       `MusicBrainz genres saved: ${Object.keys(g).length} (${Object.values(g).filter(v => !v.length).length} with no genres)`,
       `Pace: ${Math.round(store.get('cs.gap', MIN_GAP))}ms between requests · Wait until: ${bu > Date.now() ? new Date(bu).toISOString() : 'none'}`,
       plan ? `Plan: ${plan.final.map(b => `${b.name}=${b.tracks.length}`).join(', ')} · unsorted=${plan.unsorted.length} · byGenre=${plan.viaGenre}` : 'Plan: none',
@@ -780,6 +790,7 @@ function App() {
         <div className="flex items-center gap-2">
           <span className="grid h-9 w-9 place-items-center rounded-xl bg-accent text-accent-fg"><Icon name="list" className="w-5 h-5" /></span>
           <span className="font-display text-xl font-bold tracking-tight">Crate Sorter</span>
+          <span className="rounded-full border border-line px-2 py-0.5 text-xs text-muted num" title="Version">{NATIVE?.appVersion ? 'v' + NATIVE.appVersion() : 'web ' + APP_VERSION}</span>
         </div>
         {lib && (
           <div className="flex items-center gap-2 text-sm">
@@ -820,8 +831,8 @@ function App() {
             </div>
             <Toggle id="genres" checked={lookupGenres} onChange={setLookupGenres} label="Look up genres on MusicBrainz"
               hint="Better sorting. Spotify no longer shares genres, so artist names are looked up in MusicBrainz, a free music database. About 1 artist a second the first time, then saved. Uses no Spotify requests." />
-            <Toggle id="own" checked={includeOwn} onChange={setIncludeOwn} label="Also sort songs from my own playlists"
-              hint="Liked Songs are always included. This adds one request per playlist." />
+            <Toggle id="own" checked={includeOwn} onChange={setIncludeOwn} label="Read songs from my own playlists"
+              hint="Lets you choose which of your playlists to sort, as well as Liked Songs. Adds one request per playlist the first time." />
             <Btn onClick={connect} disabled={IN_PREVIEW} className="w-full text-base py-4"><Icon name="music" className="w-5 h-5" />Connect &amp; Automatically Sync Spotify</Btn>
             <Btn kind="ghost" onClick={() => load(true)} className="w-full"><Icon name="eye" />Try it with a sample library</Btn>
             <details className="rounded-xl border border-line p-3 text-sm">
@@ -877,7 +888,7 @@ function App() {
         <>
           {demo && <Notice tone="accent" icon="eye">You're looking at a sample library. Every button works, and nothing touches a real account.</Notice>}
           <div className="grid grid-cols-3 gap-2">
-            {[[lib.tracks.length, 'songs found'], [plan.final.length, 'new playlists'], [lib.playlists.length, 'left untouched']].map(([n, l]) => (
+            {[[plan.chosen, plan.chosen === lib.tracks.length ? 'songs found' : `of ${lib.tracks.length.toLocaleString()} songs used`], [plan.final.length, 'new playlists'], [lib.playlists.length, 'left untouched']].map(([n, l]) => (
               <div key={l} className="rounded-xl border border-line bg-surface p-3">
                 <div className="font-display text-2xl font-bold num">{n.toLocaleString()}</div>
                 <div className="text-xs text-muted">{l}</div>
@@ -927,20 +938,7 @@ function App() {
               hint={unsortedToPop ? 'Every song lands somewhere.' : `${plural(plan.unsorted.length, 'song')} will be left out.`} />
           </Panel>
 
-          <Panel className="flex flex-col gap-2">
-            <div className="flex items-center gap-2"><Icon name="shield" className="w-5 h-5 text-ok" /><h2 className="text-lg font-bold">Your playlists stay as they are</h2></div>
-            <p className="text-sm text-muted">Crate Sorter only reads these. Names, songs and order are not changed, and Liked Songs isn't changed either.</p>
-            <ul className="flex flex-col gap-1.5">
-              {lib.playlists.map(p => (
-                <li key={p.id} className="flex items-center gap-2 text-sm">
-                  <Icon name="lock" className="w-3.5 h-3.5 text-muted" />
-                  <span className="min-w-0 flex-1 truncate">{p.name}</span>
-                  <span className="shrink-0 text-xs text-muted num">{plural(p.items?.total ?? p.tracks?.total ?? 0, 'song')}</span>
-                </li>
-              ))}
-              {!lib.playlists.length && <li className="text-sm text-muted">No playlists found.</li>}
-            </ul>
-          </Panel>
+          <SourcePicker lib={lib} skipSrc={skipSrc} setSkipSrc={setSkipSrc} />
 
           {hasUndo && (
             <UndoPanel journal={journal} onUndo={undo}
@@ -1020,6 +1018,74 @@ function App() {
       )}
       <TroublePanel report={report} />
     </div>
+  );
+}
+
+// Where songs come from, and which playlists involve other people.
+function SourcePicker({ lib, skipSrc, setSkipSrc }) {
+  const me = lib.me.id;
+  const counts = useMemo(() => {
+    const c = {};
+    for (const t of lib.tracks) for (const s of t.src || []) c[s] = (c[s] || 0) + 1;
+    return c;
+  }, [lib]);
+  const mine = lib.playlists.filter(p => p.owner?.id === me && !p.collaborative);
+  const shared = lib.playlists.filter(p => p.collaborative);
+  const others = lib.playlists.filter(p => p.owner?.id !== me && !p.collaborative);
+  const pickable = p => p.owner?.id === me && p.read;
+  const ids = ['liked', ...lib.playlists.filter(pickable).map(p => p.id)];
+  const using = ids.filter(id => !skipSrc.has(id)).length;
+  const toggle = (id, on) => setSkipSrc(s => { const n = new Set(s); on ? n.delete(id) : n.add(id); return n; });
+  const Chip = ({ children, tone }) => <span className={'shrink-0 rounded-full border px-2 py-0.5 text-[11px] ' + (tone === 'people' ? 'border-warn text-warn' : 'border-line text-muted')}>{children}</span>;
+  const Row = ({ p }) => {
+    const can = pickable(p);
+    const chips = [];
+    if (p.collaborative) chips.push(<Chip key="c" tone="people">Collaborative</Chip>);
+    if (p.owner?.id !== me) chips.push(<Chip key="o" tone="people">By {p.owner?.name || 'someone else'}</Chip>);
+    if (p.public === true) chips.push(<Chip key="p">Public</Chip>);
+    if (p.public === false) chips.push(<Chip key="p">Private</Chip>);
+    return (
+      <li className={'flex items-start gap-3 py-1.5 ' + (can ? '' : 'opacity-70')}>
+        {can
+          ? <input id={'src' + p.id} type="checkbox" className="mt-1 h-4 w-4 accent-[var(--accent)]" checked={!skipSrc.has(p.id)} onChange={e => toggle(p.id, e.target.checked)} aria-label={'Use songs from ' + p.name} />
+          : <span className="mt-1 text-muted"><Icon name="lock" className="w-4 h-4" /></span>}
+        <label htmlFor={can ? 'src' + p.id : undefined} className="min-w-0 flex-1">
+          <span className="block truncate text-sm font-medium">{p.name}</span>
+          <span className="mt-0.5 flex flex-wrap items-center gap-1 text-xs text-muted">
+            <span className="num">{can ? plural(counts[p.id] || 0, 'song') : plural(p.items?.total ?? 0, 'song')}</span>{chips}
+          </span>
+        </label>
+      </li>
+    );
+  };
+  const Group = ({ title, hint, list, open = true }) => list.length ? (
+    <details open={open} className="border-t border-line pt-2">
+      <summary className="flex items-center justify-between text-sm font-semibold">{title} <span className="text-muted font-normal num">{list.length}<Icon name="chevron" className="inline w-4 h-4 ml-1" /></span></summary>
+      {hint && <p className="text-xs text-muted mt-1">{hint}</p>}
+      <ul className="mt-1">{list.map(p => <Row key={p.id} p={p} />)}</ul>
+    </details>
+  ) : null;
+  return (
+    <Panel className="flex flex-col gap-2">
+      <div className="flex items-center gap-2"><Icon name="list" className="w-5 h-5 text-accent" /><h2 className="text-lg font-bold">Songs come from</h2></div>
+      <p className="text-sm text-muted">Tick the places to sort songs from. Crate Sorter only reads these and never changes them.</p>
+      <div className="flex items-center justify-between gap-2 text-sm">
+        <span className="text-muted num">Using {using} of {ids.length}</span>
+        <span className="flex gap-2">
+          <button className="rounded-lg border border-line px-3 py-1.5" onClick={() => setSkipSrc(new Set())}>All</button>
+          <button className="rounded-lg border border-line px-3 py-1.5" onClick={() => setSkipSrc(new Set(ids))}>None</button>
+        </span>
+      </div>
+      <label htmlFor="srcliked" className="flex items-start gap-3 py-1.5">
+        <input id="srcliked" type="checkbox" className="mt-1 h-4 w-4 accent-[var(--accent)]" checked={!skipSrc.has('liked')} onChange={e => toggle('liked', e.target.checked)} />
+        <span><span className="block text-sm font-medium">Liked Songs</span><span className="text-xs text-muted num">{plural(counts.liked ?? lib.likedTotal ?? lib.tracks.length, 'song')}</span></span>
+      </label>
+      {!lib.includeOwn && <p className="text-xs text-muted">Turn on “Read songs from my own playlists” on the start screen to choose your playlists too.</p>}
+      <Group title="Your playlists" list={mine} open={mine.length <= 30} />
+      <Group title="Shared with other people" hint="Collaborative playlists: other people can add or remove songs. You can sort the ones you own." list={shared} />
+      <Group title="Made by other people" hint="Playlists you follow. Spotify doesn't let apps read their songs, so they can't be used." list={others} open={false} />
+      <p className="text-xs text-muted">Spotify doesn't tell apps who follows your playlists or whether you've shared a link, so playlists can only be marked by owner, collaborative and public.</p>
+    </Panel>
   );
 }
 

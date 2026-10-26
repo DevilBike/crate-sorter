@@ -127,6 +127,9 @@ class MainActivity : Activity() {
         fun mbPoll(): String = GenreStore.poll(this@MainActivity)
 
         @JavascriptInterface
+        fun appVersion(): String = packageManager.getPackageInfo(packageName, 0).versionName ?: ""
+
+        @JavascriptInterface
         fun copy(text: String) {
             val cm = getSystemService(ClipboardManager::class.java)
             cm.setPrimaryClip(ClipData.newPlainText("Crate Sorter", text))

@@ -50,7 +50,9 @@ jobs:
         run: gradle --no-daemon assembleRelease
 
       - name: Name the APK
-        run: cp android/app/build/outputs/apk/release/app-release.apk CrateSorter.apk
+        run: |
+          cp android/app/build/outputs/apk/release/app-release.apk CrateSorter.apk
+          cp CrateSorter.apk CrateSorter-1.${{ github.run_number }}.apk
 
       - uses: actions/upload-artifact@v4
         with:
@@ -61,8 +63,10 @@ jobs:
         uses: softprops/action-gh-release@v2
         with:
           tag_name: app-v${{ github.run_number }}
-          name: Crate Sorter app ${{ github.run_number }}
-          files: CrateSorter.apk
+          name: Crate Sorter 1.${{ github.run_number }}
+          files: |
+            CrateSorter.apk
+            CrateSorter-1.${{ github.run_number }}.apk
           make_latest: true
           body: |
             Install on Android: download CrateSorter.apk below, open it, and allow installing from your browser if asked.

@@ -14,7 +14,7 @@ android {
         minSdk = 26
         targetSdk = 35
         versionCode = buildNumber
-        versionName = "1.0.$buildNumber"
+        versionName = "1.$buildNumber"
     }
 
     // CI passes in a signing key that it keeps between builds, so each new APK installs
