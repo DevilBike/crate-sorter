@@ -98,7 +98,7 @@ function Icon({ name, className = 'w-4 h-4' }) {
 const SCOPES = 'playlist-read-private playlist-read-collaborative playlist-modify-private user-library-read user-library-modify';
 const REDIRECT = location.origin + location.pathname;
 const API = 'https://api.spotify.com/v1';
-const POST_DELAY = 200;
+const MIN_GAP = 600; // ms between Spotify requests. Slow on purpose: fewer bursts, fewer 429s.
 const IN_PREVIEW = (() => { try { return window.self !== window.top; } catch { return true; } })();
 
 // Ten buckets. kw = words matched against artist genres, title = words matched against song/album names.
@@ -182,8 +182,9 @@ async function finishLogin(clientId) {
   return true;
 }
 
-/* ---------- API client with refresh, 429 back-off and retries ---------- */
+/* ---------- API client: one request at a time, paced, and it never gives up on a 429 ---------- */
 function makeApi(clientId, onWait) {
+  let gap = MIN_GAP, last = 0;
   async function token() {
     let t = store.get('cs.tok');
     if (!t) throw new Error('You are not signed in.');
@@ -193,22 +194,45 @@ function makeApi(clientId, onWait) {
     }
     return t.access;
   }
-  async function call(method, path, body, tries = 0) {
+  async function backoff(seconds, why) {
+    gap = Math.min(gap * 2, 10000); // stay slower for the rest of the session
+    await onWait?.(seconds, why);
+    await sleep(seconds * 1000 + 500);
+  }
+  let chain = Promise.resolve();
+  // Requests queue up so only one is ever in flight.
+  function call(method, path, body) {
+    const run = chain.then(() => send(method, path, body, 0));
+    chain = run.catch(() => {});
+    return run;
+  }
+  async function send(method, path, body, tries) {
+    const wait = last + gap - Date.now();
+    if (wait > 0) await sleep(wait);
+    last = Date.now();
     const url = path.startsWith('http') ? path : API + path;
-    const r = await fetch(url, { method, body: body ? JSON.stringify(body) : undefined,
-      headers: { Authorization: 'Bearer ' + await token(), ...(body ? { 'Content-Type': 'application/json' } : {}) } });
-    if (r.status === 429 && tries < 6) {
-      const s = Number(r.headers.get('Retry-After')) || 2 ** tries;
-      onWait?.(s); await sleep(s * 1000 + 250); return call(method, path, body, tries + 1);
+    let r;
+    try {
+      r = await fetch(url, { method, body: body ? JSON.stringify(body) : undefined,
+        headers: { Authorization: 'Bearer ' + await token(), ...(body ? { 'Content-Type': 'application/json' } : {}) } });
+    } catch (e) {
+      // A rate-limited reply sometimes arrives without CORS headers, which the browser reports as a network error.
+      if (tries < 8) { await backoff(Math.min(30 * 2 ** tries, 600), 'network'); return send(method, path, body, tries + 1); }
+      throw new Error('Could not reach Spotify. Check your connection and try again.');
     }
-    if (r.status >= 500 && tries < 3) { await sleep(1000 * (tries + 1)); return call(method, path, body, tries + 1); }
-    if (r.status === 401 && tries < 1) { const t = store.get('cs.tok'); if (t) store.set('cs.tok', { ...t, exp: 0 }); return call(method, path, body, tries + 1); }
+    if (r.status === 429) {
+      await backoff(Number(r.headers.get('Retry-After')) || Math.min(30 * 2 ** Math.min(tries, 4), 600), 'limit');
+      return send(method, path, body, tries + 1);
+    }
+    if (r.status >= 500 && tries < 4) { await sleep(3000 * (tries + 1)); return send(method, path, body, tries + 1); }
+    if (r.status === 401 && tries < 1) { const t = store.get('cs.tok'); if (t) store.set('cs.tok', { ...t, exp: 0 }); return send(method, path, body, tries + 1); }
     const txt = await r.text();
     let j = null; try { j = txt ? JSON.parse(txt) : null; } catch {}
     if (!r.ok) {
       const e = new Error(`${method} ${url.replace(API, '').split('?')[0]} failed (${r.status}): ${j?.error?.message || txt || r.statusText}`);
       e.status = r.status; throw e;
     }
+    gap = Math.max(MIN_GAP, gap * 0.97);
     return j;
   }
   async function all(path, onPage) {
@@ -223,42 +247,51 @@ function makeApi(clientId, onWait) {
 function rowTrack(row) {
   const t = (row && typeof row.item === 'object' && row.item) || (row && typeof row.track === 'object' && row.track) || null;
   if (!t || !t.id || t.is_local || (t.type && t.type !== 'track')) return null;
-  return { id: t.id, uri: t.uri || 'spotify:track:' + t.id, name: t.name || '', album: t.album?.name || '',
+  return { id: t.id, name: t.name || '', album: t.album?.name || '',
     year: parseInt(t.album?.release_date, 10) || null, artists: (t.artists || []).filter(a => a.id).map(a => ({ id: a.id, name: a.name })) };
 }
 
-async function loadLibrary(api, { includeOwn }, log) {
-  const me = await api.call('GET', '/me');
-  log(`Signed in as ${me.display_name || me.id}`);
-  const playlists = await api.all('/me/playlists?limit=50', n => log(`Found ${plural(n, 'playlist')}`, true));
-  const saved = await api.all('/me/tracks?limit=50', (n, t) => log(`Reading Liked Songs ${n}/${t}`, true));
-  let tracks = saved.map(rowTrack).filter(Boolean);
-  if (includeOwn) {
-    const own = playlists.filter(p => p.owner?.id === me.id && !p.collaborative);
-    for (const [i, p] of own.entries()) {
-      log(`Reading “${p.name}” (${i + 1}/${own.length})`, true);
-      const rows = await api.all(`/playlists/${p.id}/items?limit=50`);
-      tracks.push(...rows.map(rowTrack).filter(Boolean));
+// The library is saved after the first read, so opening the app again costs no requests until you tap Refresh.
+async function loadLibrary(api, { includeOwn, lookupGenres, refresh }, log) {
+  let lib = refresh ? null : store.get('cs.lib');
+  if (lib && lib.includeOwn !== includeOwn) lib = null;
+  if (lib) {
+    log(`Using your library saved ${new Date(lib.at).toLocaleString([], { dateStyle: 'medium', timeStyle: 'short' })} (no requests needed)`);
+  } else {
+    const me = await api.call('GET', '/me');
+    log(`Signed in as ${me.display_name || me.id}`);
+    const raw = await api.all('/me/playlists?limit=50', n => log(`Found ${plural(n, 'playlist')}`, true));
+    const playlists = raw.map(p => ({ id: p.id, name: p.name, owner: { id: p.owner?.id }, collaborative: !!p.collaborative, items: { total: p.items?.total ?? p.tracks?.total ?? 0 } }));
+    const saved = await api.all('/me/tracks?limit=50', (n, t) => log(`Reading Liked Songs ${n}/${t}`, true));
+    let tracks = saved.map(rowTrack).filter(Boolean);
+    if (includeOwn) {
+      const own = playlists.filter(p => p.owner.id === me.id && !p.collaborative);
+      for (const [i, p] of own.entries()) {
+        log(`Reading “${p.name}” (${i + 1}/${own.length})`, true);
+        const rows = await api.all(`/playlists/${p.id}/items?limit=50`);
+        tracks.push(...rows.map(rowTrack).filter(Boolean));
+      }
+    }
+    const seen = new Set(); tracks = tracks.filter(t => !seen.has(t.id) && seen.add(t.id));
+    lib = { at: Date.now(), includeOwn, me: { id: me.id, display_name: me.display_name }, playlists, tracks };
+    store.set('cs.lib', lib);
+  }
+  log(`${plural(lib.tracks.length, 'unique song')} to sort`);
+
+  // The batch GET /artists endpoint was removed in Feb 2026, so each genre lookup is its own request.
+  // Only each song's main artist is looked up, and every answer is saved, so an interrupted read picks up where it stopped.
+  const cache = store.get('cs.genres', {});
+  if (lookupGenres) {
+    const ids = [...new Set(lib.tracks.map(t => t.artists[0]?.id).filter(Boolean))];
+    const todo = ids.filter(id => !(id in cache));
+    if (todo.length) log(`Looking up ${plural(todo.length, 'artist')}, about ${Math.max(1, Math.ceil(todo.length * MIN_GAP / 60000))} min. Already saved: ${ids.length - todo.length}.`);
+    for (const [i, id] of todo.entries()) {
+      try { const a = await api.call('GET', '/artists/' + id); cache[id] = a.genres || []; }
+      catch (e) { if (e.status === 400 || e.status === 404 || e.status === 403) cache[id] = []; else { store.set('cs.genres', cache); throw e; } }
+      if (i % 5 === 4 || i === todo.length - 1) { store.set('cs.genres', cache); log(`Artist genres ${ids.length - todo.length + i + 1}/${ids.length}`, true); }
     }
   }
-  const seen = new Set(); tracks = tracks.filter(t => !seen.has(t.id) && seen.add(t.id));
-  log(`${plural(tracks.length, 'unique song')} to sort`);
-
-  // The batch GET /artists endpoint was removed in Feb 2026, so genres come one artist at a time (cached).
-  const cache = store.get('cs.genres', {});
-  const ids = [...new Set(tracks.flatMap(t => t.artists.map(a => a.id)))];
-  const todo = ids.filter(id => !(id in cache));
-  let done = ids.length - todo.length;
-  await Promise.all(Array.from({ length: 3 }, async () => {
-    while (todo.length) {
-      const id = todo.shift();
-      try { const a = await api.call('GET', '/artists/' + id); cache[id] = a.genres || []; }
-      catch (e) { if (e.status === 400 || e.status === 404 || e.status === 403) cache[id] = []; else throw e; }
-      if (++done % 10 === 0 || !todo.length) { log(`Reading artist genres ${done}/${ids.length}`, true); store.set('cs.genres', cache); }
-    }
-  }));
-  store.set('cs.genres', cache);
-  return { me, playlists, tracks, genres: cache };
+  return { ...lib, tracks: lib.tracks.map(t => ({ ...t, uri: t.uri || 'spotify:track:' + t.id })), genres: cache };
 }
 
 /* ---------- Classification ---------- */
@@ -310,26 +343,39 @@ function makeCaller(api, simulate) {
   return simulate ? async () => { await sleep(90); return { id: 'sim' + Math.random().toString(36).slice(2, 9) }; } : api.call;
 }
 // Existing playlists are never edited: the only writes are creating new playlists and adding songs to them.
-async function runAutomation(plan, call, dry, demo, push, setPct) {
+// Progress is saved after every request, so a stopped run resumes without creating anything twice.
+async function runAutomation(plan, call, dry, demo, push, setPct, prev) {
   const filled = plan.final;
   const total = filled.reduce((n, b) => n + 1 + Math.ceil(b.tracks.length / 100), 0) || 1;
   let done = 0; const tick = () => setPct(Math.round(++done / total * 100));
   const stamp = new Date().toLocaleDateString(undefined, { year: 'numeric', month: 'short', day: 'numeric' });
-  const journal = { at: new Date().toISOString(), dry, demo, created: [] };
+  const resume = !dry && prev && !prev.finished && !!prev.demo === !!demo;
+  const journal = resume ? prev : { at: new Date().toISOString(), dry, demo, created: [] };
   const save = () => { if (!dry) store.set('cs.journal', journal); };
   const verb = dry ? 'Would ' : '';
+  if (resume) push('Resuming the run that stopped. Nothing is created twice.', 'ok');
   for (const b of filled) {
-    push(`${verb}${dry ? 'create' : 'Creating'} ‘${b.name}’ playlist${dry ? '' : '…'}`);
-    const pl = await call('POST', '/me/playlists', { name: b.name, public: false, description: `${b.blurb}. Sorted by Crate Sorter on ${stamp}.` });
-    journal.created.push({ id: pl.id, name: b.name }); save(); tick(); await sleep(POST_DELAY);
     const uris = b.tracks.map(t => t.uri);
+    let entry = journal.created.find(c => c.key === b.key);
+    if (entry) push(`‘${b.name}’ already exists, ${entry.added}/${uris.length} songs added`);
+    else {
+      push(`${verb}${dry ? 'create' : 'Creating'} ‘${b.name}’ playlist${dry ? '' : '…'}`);
+      const pl = await call('POST', '/me/playlists', { name: b.name, public: false, description: `${b.blurb}. Sorted by Crate Sorter on ${stamp}.` });
+      entry = { key: b.key, id: pl.id, name: b.name, added: 0 };
+      journal.created.push(entry); save();
+    }
+    tick();
     for (let i = 0; i < uris.length; i += 100) {
       const chunk = uris.slice(i, i + 100);
-      push(`${verb}${dry ? 'add' : 'Adding'} ${chunk.length} tracks to ‘${b.name}’ (${i + chunk.length}/${uris.length})`);
-      await call('POST', `/playlists/${pl.id}/items`, { uris: chunk });
-      tick(); await sleep(POST_DELAY);
+      if (i >= entry.added) {
+        push(`${verb}${dry ? 'add' : 'Adding'} ${chunk.length} tracks to ‘${b.name}’ (${i + chunk.length}/${uris.length})`);
+        await call('POST', `/playlists/${entry.id}/items`, { uris: chunk });
+        entry.added = i + chunk.length; save();
+      }
+      tick();
     }
   }
+  journal.finished = true; save();
   return journal;
 }
 async function runUndo(journal, call, push, setPct) {
@@ -339,7 +385,7 @@ async function runUndo(journal, call, push, setPct) {
     push(`Removing ‘${c.name}’`);
     try { await call('DELETE', '/me/library?uris=' + encodeURIComponent('spotify:playlist:' + c.id)); }
     catch (e) { push(`Could not remove ‘${c.name}’. Delete it in the Spotify app. (${e.message})`, 'err'); }
-    tick(); await sleep(POST_DELAY);
+    tick();
   }
 }
 
@@ -449,6 +495,7 @@ function App() {
   const [view, setView] = useState('welcome');
   const [clientId, setClientId] = useState(() => store.get('cs.clientId', ''));
   const [includeOwn, setIncludeOwn] = useState(() => store.get('cs.includeOwn', false));
+  const [lookupGenres, setLookupGenres] = useState(() => store.get('cs.lookupGenres', true));
   const [demo, setDemo] = useState(false);
   const [lib, setLib] = useState(null);
   const [err, setErr] = useState('');
@@ -471,14 +518,17 @@ function App() {
     const next = replaceLast && ls.length && ls[ls.length - 1].live ? ls.slice(0, -1) : ls;
     return [...next, { t, msg, tone, live: replaceLast }];
   });
-  const api = useMemo(() => makeApi(clientId.trim(), s => push(`Spotify asked us to slow down. Waiting ${s}s…`, 'err')), [clientId]);
+  const api = useMemo(() => makeApi(clientId.trim(), (s, why) => {
+    const until = new Date(Date.now() + s * 1000).toLocaleTimeString([], { hour: '2-digit', minute: '2-digit', second: '2-digit' });
+    push(`${why === 'limit' ? 'Spotify asked us to slow down' : 'Connection dropped (often a rate limit)'}. Waiting ${s >= 120 ? Math.round(s / 60) + ' min' : s + 's'}, until ${until}, then carrying on. Keep this page open.`, 'err');
+  }), [clientId]);
   const plan = useMemo(() => lib && buildPlan(lib, { unsortedToPop, off, split, splitAt }), [lib, unsortedToPop, off, split]);
   useEffect(() => { store.set('cs.off', [...off]); store.set('cs.split', split); }, [off, split]);
 
   useEffect(() => { store.set('cs.clientId', clientId.trim()); }, [clientId]);
-  useEffect(() => { store.set('cs.includeOwn', includeOwn); }, [includeOwn]);
+  useEffect(() => { store.set('cs.includeOwn', includeOwn); store.set('cs.lookupGenres', lookupGenres); }, [includeOwn, lookupGenres]);
 
-  async function load(isDemo) {
+  async function load(isDemo, refresh = false) {
     setErr(''); setLines([]); setView('loading'); setDemo(isDemo);
     try {
       if (isDemo) {
@@ -487,7 +537,7 @@ function App() {
         push(`Reading artist genres ${Object.keys(DEMO.genres).length}/${Object.keys(DEMO.genres).length}`); await sleep(300);
         setLib(DEMO);
       } else {
-        setLib(await loadLibrary(api, { includeOwn }, (m, live) => push(m, undefined, live)));
+        setLib(await loadLibrary(api, { includeOwn, lookupGenres, refresh }, (m, live) => push(m, undefined, live)));
       }
       setView('dashboard');
     } catch (e) { setErr(e.message); setView('welcome'); }
@@ -516,12 +566,12 @@ function App() {
     const call = makeCaller(api, demo || dry);
     push(dry ? 'Dry run: nothing in your Spotify account will change.' : demo ? 'Demo run with the sample library.' : 'Starting. Only new playlists will be created.', 'ok');
     try {
-      const j = await runAutomation(plan, call, dry, demo, m => push(m), setPct);
+      const j = await runAutomation(plan, call, dry, demo, m => push(m), setPct, journal);
       if (!dry) setJournal(j);
       push(dry ? 'Dry run finished. Turn off “Dry run” to do it for real.' : `Done. ${plural(j.created.length, 'new playlist')} created. Your existing playlists were not changed.`, 'ok');
     } catch (e) {
       push(e.message, 'err');
-      push('Stopped. Everything finished so far is recorded, so you can undo it below.', 'err');
+      push('Stopped. Progress is saved: tap “Resume automation” to carry on, or undo below.', 'err');
       if (!dry) setJournal(store.get('cs.journal'));
     }
     setBusy(false);
@@ -536,6 +586,7 @@ function App() {
   }
 
   const hasUndo = journal && journal.created && journal.created.length > 0;
+  const canResume = journal && !journal.finished && !!journal.demo === demo;
 
   return (
     <div className="mx-auto max-w-xl pt-4 pb-32 flex flex-col gap-4">
@@ -581,6 +632,8 @@ function App() {
               </div>
               {copyMsg && <span className="text-xs text-muted">{copyMsg}</span>}
             </div>
+            <Toggle id="genres" checked={lookupGenres} onChange={setLookupGenres} label="Look up artist genres"
+              hint="Best sorting. One request per artist the first time, then saved. Off sorts by song names and years only." />
             <Toggle id="own" checked={includeOwn} onChange={setIncludeOwn} label="Also sort songs from my own playlists"
               hint="Liked Songs are always included. This adds one request per playlist." />
             <Btn onClick={connect} disabled={IN_PREVIEW} className="w-full text-base py-4"><Icon name="music" className="w-5 h-5" />Connect &amp; Automatically Sync Spotify</Btn>
@@ -626,6 +679,12 @@ function App() {
           <p className="text-sm text-muted -mt-1 num">
             {lib.tracks.length ? Math.round(plan.viaGenre / lib.tracks.length * 100) : 0}% sorted by artist genre, the rest by song names and release year.
           </p>
+          {!demo && lib.at && (
+            <div className="flex items-center justify-between gap-3 text-sm text-muted -mt-1">
+              <span>Library saved {new Date(lib.at).toLocaleString([], { dateStyle: 'medium', timeStyle: 'short' })}. Reopening the app uses this copy.</span>
+              <button onClick={() => load(false, true)} className="shrink-0 rounded-lg border border-line px-3 py-1.5 text-fg">Refresh</button>
+            </div>
+          )}
 
           <Panel className="flex flex-col gap-3">
             <div className="flex items-baseline justify-between gap-2"><h2 className="text-lg font-bold">New playlists</h2><span className="text-sm text-muted num">{plan.final.length} will be created</span></div>
@@ -697,7 +756,7 @@ function App() {
               ) : (
                 <>
                   <Toggle id="dry" checked={dry} onChange={setDry} label="Dry run" hint={dry ? 'Shows every step without changing anything.' : 'Real run. New playlists can be removed with Undo.'} />
-                  <Btn onClick={() => setConfirming(true)} className="w-full text-base py-4"><Icon name="play" className="w-5 h-5" />Start Full Automation</Btn>
+                  <Btn onClick={() => setConfirming(true)} className="w-full text-base py-4"><Icon name="play" className="w-5 h-5" />{canResume && !dry ? 'Resume automation' : 'Start Full Automation'}</Btn>
                 </>
               )}
             </div>
