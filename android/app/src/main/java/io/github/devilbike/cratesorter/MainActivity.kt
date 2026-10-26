@@ -36,7 +36,7 @@ class MainActivity : Activity() {
 
         web.settings.javaScriptEnabled = true
         web.settings.domStorageEnabled = true
-        web.settings.userAgentString = web.settings.userAgentString + " CrateSorterApp/1"
+        web.settings.userAgentString = web.settings.userAgentString + " CrateSorterApp/" + appVersion()
         // Keep the page's renderer at full priority even when it isn't on screen.
         web.setRendererPriorityPolicy(WebView.RENDERER_PRIORITY_IMPORTANT, false)
         web.addJavascriptInterface(Bridge(), "CrateNative")
@@ -60,6 +60,12 @@ class MainActivity : Activity() {
         if (savedInstanceState != null) web.restoreState(savedInstanceState) else web.loadUrl(START_URL)
     }
 
+    @Suppress("DEPRECATION")
+    private fun appVersion(): Long {
+        val info = packageManager.getPackageInfo(packageName, 0)
+        return if (Build.VERSION.SDK_INT >= 28) info.longVersionCode else info.versionCode.toLong()
+    }
+
     override fun onSaveInstanceState(outState: Bundle) {
         super.onSaveInstanceState(outState)
         web.saveState(outState)
@@ -73,7 +79,8 @@ class MainActivity : Activity() {
     }
 
     override fun onDestroy() {
-        stopService(Intent(this, WorkService::class.java))
+        // Genre lookups keep running in the service; only the page's own work stops here.
+        WorkService.pageDone()
         web.destroy()
         super.onDestroy()
     }
@@ -84,7 +91,7 @@ class MainActivity : Activity() {
         ) {
             requestPermissions(arrayOf(Manifest.permission.POST_NOTIFICATIONS), 1)
         }
-        startForegroundService(Intent(this, WorkService::class.java))
+        WorkService.send(this, WorkService.ACTION_UI_ON)
     }
 
     inner class Bridge {
@@ -103,10 +110,21 @@ class MainActivity : Activity() {
                     web.resumeTimers()
                     startWork()
                 } else {
-                    stopService(Intent(this@MainActivity, WorkService::class.java))
+                    WorkService.pageDone()
                 }
             }
         }
+
+        // items: JSON array of [spotifyArtistId, artistName]. Returns how many are queued.
+        @JavascriptInterface
+        fun mbStart(items: String): Int {
+            val n = GenreStore.enqueue(this@MainActivity, items)
+            if (n > 0) handler.post { WorkService.send(this@MainActivity, WorkService.ACTION_GENRES) }
+            return n
+        }
+
+        @JavascriptInterface
+        fun mbPoll(): String = GenreStore.poll(this@MainActivity)
 
         @JavascriptInterface
         fun copy(text: String) {
