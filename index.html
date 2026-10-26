@@ -100,7 +100,7 @@ const REDIRECT = location.origin + location.pathname;
 const API = 'https://api.spotify.com/v1';
 const MIN_GAP = 600; // ms between Spotify requests. Slow on purpose: fewer bursts, fewer 429s.
 const IN_PREVIEW = (() => { try { return window.self !== window.top; } catch { return true; } })();
-const APP_VERSION = '2026-10-26.5';
+const APP_VERSION = '2026-10-26.6';
 try { localStorage.removeItem('cs.genres'); } catch {}
 
 // Ten buckets. kw = words matched against artist genres, title = words matched against song/album names.
@@ -281,10 +281,10 @@ function rowTrack(row) {
     year: parseInt(t.album?.release_date, 10) || null, artists: (t.artists || []).filter(a => a.id).map(a => ({ id: a.id, name: a.name })) };
 }
 
-let mbLast = 0;
+let mbLast = 0, mbGap = 1200; // MusicBrainz asks for about 1 request a second; widen after a 503 and ease back.
 // Returns a list of genre tags for an artist name, [] when MusicBrainz has none, or null when it couldn't be reached.
 async function musicBrainzGenres(name, tries = 0) {
-  const wait = mbLast + 1150 - Date.now();
+  const wait = mbLast + mbGap - Date.now();
   if (wait > 0) await sleep(wait);
   mbLast = Date.now();
   const url = 'https://musicbrainz.org/ws/2/artist/?fmt=json&limit=3&query=' + encodeURIComponent(`artist:"${name.replace(/"/g, '')}"`);
@@ -292,7 +292,12 @@ async function musicBrainzGenres(name, tries = 0) {
   try { r = await fetch(url, { headers: { Accept: 'application/json' } }); }
   catch (e) { debug.add('MB', `"${name}" → no response (${e.message})`); if (tries < 2) { await sleep(5000); return musicBrainzGenres(name, tries + 1); } return null; }
   debug.add('MB', `"${name}" → ${r.status} ${Date.now() - mbLast}ms`);
-  if (r.status === 503 || r.status === 429) { if (tries < 4) { await sleep(5000 * (tries + 1)); return musicBrainzGenres(name, tries + 1); } return null; }
+  if (r.status === 503 || r.status === 429) {
+    mbGap = Math.min(mbGap * 1.5, 5000);
+    if (tries < 4) { await sleep(5000 * (tries + 1)); return musicBrainzGenres(name, tries + 1); }
+    return null;
+  }
+  mbGap = Math.max(1200, mbGap * 0.95);
   if (!r.ok) return [];
   const j = await r.json().catch(() => ({}));
   const want = name.toLowerCase();
@@ -334,14 +339,14 @@ async function loadLibrary(api, { includeOwn, lookupGenres, refresh }, log) {
     const artists = new Map();
     for (const t of lib.tracks) { const a = t.artists[0]; if (a && !artists.has(a.id)) artists.set(a.id, a.name); }
     const todo = [...artists].filter(([id]) => !(id in cache));
-    if (todo.length) log(`Looking up genres for ${plural(todo.length, 'artist')} on MusicBrainz, about ${Math.max(1, Math.ceil(todo.length * 1.15 / 60))} min. Already saved: ${artists.size - todo.length}.`);
+    if (todo.length) log(`Looking up genres for ${plural(todo.length, 'artist')} on MusicBrainz, about ${Math.max(1, Math.ceil(todo.length * 1.4 / 60))} min. Already saved: ${artists.size - todo.length}.`);
     let failures = 0;
     for (const [i, [id, name]] of todo.entries()) {
       const r = await musicBrainzGenres(name);
       if (r === null) {
         if (++failures >= 3) { log('MusicBrainz is not answering, so the rest are sorted by song names and years. Tap Refresh later to try again.'); break; }
-      } else { failures = 0; cache[id] = r; }
-      if (i % 5 === 4 || i === todo.length - 1) { store.set('cs.mbgenres', cache); log(`Artist genres ${artists.size - todo.length + i + 1}/${artists.size}`, true); }
+      } else { failures = 0; cache[id] = r; store.set('cs.mbgenres', cache); } // saved every time, so a reload loses nothing
+      if (i % 5 === 4 || i === todo.length - 1) { log(`Artist genres ${artists.size - todo.length + i + 1}/${artists.size}`, true); }
     }
     store.set('cs.mbgenres', cache);
   }
@@ -566,6 +571,22 @@ function App() {
   const splitAt = 150;
   const [runKind, setRunKind] = useState('');
   const [busy, setBusy] = useState(false);
+  const loadingRef = useRef(false);
+  const working = view === 'loading' || busy;
+
+  // Keep the screen on while working: Android browsers pause or reload pages that go to the background.
+  useEffect(() => {
+    if (!working || !navigator.wakeLock) return;
+    let lock = null, stopped = false;
+    const grab = async () => {
+      if (stopped || document.hidden) return;
+      try { lock = await navigator.wakeLock.request('screen'); debug.add('PAGE', 'screen kept awake'); }
+      catch (e) { debug.add('PAGE', 'could not keep screen awake: ' + e.message); }
+    };
+    grab();
+    document.addEventListener('visibilitychange', grab);
+    return () => { stopped = true; document.removeEventListener('visibilitychange', grab); lock?.release().catch(() => {}); };
+  }, [working]);
 
   const push = (msg, tone, replaceLast) => { if (!replaceLast) debug.add(tone === 'err' ? 'WARN' : 'LOG', msg); setLines(ls => {
     const t = new Date().toLocaleTimeString([], { hour: '2-digit', minute: '2-digit', second: '2-digit' });
@@ -583,6 +604,8 @@ function App() {
   useEffect(() => { store.set('cs.includeOwn', includeOwn); store.set('cs.lookupGenres', lookupGenres); }, [includeOwn, lookupGenres]);
 
   async function load(isDemo, refresh = false) {
+    if (loadingRef.current) return debug.add('LOG', 'Ignored a second load while one is running');
+    loadingRef.current = true;
     setErr(''); setLines([]); setView('loading'); setDemo(isDemo);
     try {
       if (isDemo) {
@@ -595,6 +618,7 @@ function App() {
       }
       setView('dashboard');
     } catch (e) { setErr(e.message); setView('welcome'); }
+    loadingRef.current = false;
   }
 
   // Coming back from Spotify's sign-in page.
@@ -737,7 +761,7 @@ function App() {
       {view === 'loading' && (
         <Panel className="flex flex-col gap-3">
           <div className="flex items-center gap-2 font-semibold"><Icon name="loader" className="w-5 h-5 spin text-accent" />Reading your library</div>
-          <p className="text-sm text-muted">Large libraries take a few minutes, because Spotify now only gives out genres one artist at a time.</p>
+          <p className="text-sm text-muted">The first genre lookup takes a while for a big library (about 1 artist a second). The screen stays on while this runs. Leave this page in front, ideally plugged in. If you leave, progress is saved and it carries on when you come back.</p>
           <Log lines={lines} />
         </Panel>
       )}
