@@ -74,6 +74,7 @@ const ICONS = {
   play: [['polygon', { points: '6 3 20 12 6 21 6 3' }]],
   check: [['path', { d: 'M20 6 9 17l-5-5' }]],
   loader: [['path', { d: 'M21 12a9 9 0 1 1-6.219-8.56' }]],
+  heart: [['path', { d: 'M19 14c1.49-1.46 3-3.21 3-5.5A5.5 5.5 0 0 0 16.5 3c-1.76 0-3 .5-4.5 2-1.5-1.5-2.74-2-4.5-2A5.5 5.5 0 0 0 2 8.5c0 2.3 1.5 4.05 3 5.5l7 7Z' }]],
   undo: [['path', { d: 'M3 12a9 9 0 1 0 9-9 9.75 9.75 0 0 0-6.74 2.74L3 8' }], ['path', { d: 'M3 3v5h5' }]],
   alert: [['path', { d: 'm21.73 18-8-14a2 2 0 0 0-3.48 0l-8 14A2 2 0 0 0 4 21h16a2 2 0 0 0 1.73-3' }], ['path', { d: 'M12 9v4' }], ['path', { d: 'M12 17h.01' }]],
   logout: [['path', { d: 'M9 21H5a2 2 0 0 1-2-2V5a2 2 0 0 1 2-2h4' }], ['polyline', { points: '16 17 21 12 16 7' }], ['line', { x1: 21, y1: 12, x2: 9, y2: 12 }]],
@@ -100,7 +101,7 @@ const REDIRECT = location.origin + location.pathname;
 const API = 'https://api.spotify.com/v1';
 const MIN_GAP = 600; // ms between Spotify requests. Slow on purpose: fewer bursts, fewer 429s.
 const IN_PREVIEW = (() => { try { return window.self !== window.top; } catch { return true; } })();
-const APP_VERSION = '2026-10-26.11';
+const APP_VERSION = '2026-10-26.12';
 try { localStorage.removeItem('cs.genres'); } catch {}
 
 // Ten buckets. kw = words matched against artist genres, title = words matched against song/album names.
@@ -380,8 +381,9 @@ async function loadLibrary(api, { includeOwn, lookupGenres, refresh }, log) {
     const add = (rows, src) => { for (const t of rows.map(rowTrack).filter(Boolean)) { const have = byId.get(t.id); if (have) { if (!have.src.includes(src)) have.src.push(src); } else byId.set(t.id, { ...t, src: [src] }); } };
     add(saved, 'liked');
     if (includeOwn) {
-      // Spotify only lets apps read the songs in playlists you own (since Feb 2026).
-      const own = playlists.filter(p => p.owner.id === me.id);
+      // Spotify only lets apps read the songs in playlists you own (since Feb 2026). Collaborative
+      // playlists owned by someone else are tried too, and skipped if Spotify refuses.
+      const own = playlists.filter(p => p.owner.id === me.id || p.collaborative);
       for (const [i, p] of own.entries()) {
         log(`Reading “${p.name}” (${i + 1}/${own.length})`, true);
         try { add(await api.all(`/playlists/${p.id}/items?limit=50`), p.id); p.read = true; }
@@ -517,6 +519,7 @@ async function runAutomation(plan, call, dry, demo, push, setPct, prev) {
       tick();
     }
   }
+  journal.placed = filled.flatMap(b => b.tracks.map(t => t.uri));
   journal.finished = true; save();
   return journal;
 }
@@ -529,6 +532,56 @@ async function runUndo(journal, call, push, setPct) {
     catch (e) { push(`Could not remove ‘${c.name}’. Delete it in the Spotify app. (${e.message})`, 'err'); }
     tick();
   }
+}
+
+// Optional, and only on request: removes liked songs that are now in the new playlists.
+// A private backup playlist with every liked song is made and checked first, and nothing is removed
+// unless the backup holds them all. Progress is saved after every request, like the main run.
+const LIB_CHUNK = 40; // Spotify's limit for saving or removing library items in one request
+async function runClearLiked(st, call, demo, push, setPct) {
+  const save = () => store.set('cs.unlike', st);
+  const total = Math.ceil(st.backup.length / 100) + 2 + Math.ceil(st.remove.length / LIB_CHUNK);
+  let done = 0; const tick = () => setPct(Math.round(++done / total * 100));
+  if (!st.backupId) {
+    push(`Creating ‘${st.backupName}’ with all ${plural(st.backup.length, 'liked song')}…`);
+    const pl = await call('POST', '/me/playlists', { name: st.backupName, public: false, description: 'Copy of your Liked Songs made by Crate Sorter before clearing them. Use Restore in Crate Sorter to like them again.' });
+    st.backupId = pl.id; save();
+  }
+  tick();
+  for (let i = st.added; i < st.backup.length; i += 100) {
+    const chunk = st.backup.slice(i, i + 100);
+    push(`Backing up ${i + chunk.length}/${st.backup.length}`, undefined, true);
+    await call('POST', `/playlists/${st.backupId}/items`, { uris: chunk });
+    st.added = i + chunk.length; save(); tick();
+  }
+  if (!st.verified) {
+    const r = await call('GET', `/playlists/${st.backupId}/items?limit=1`);
+    if (!demo && !(typeof r?.total === 'number' && r.total >= st.backup.length))
+      throw new Error(`The backup playlist has ${r?.total ?? 'an unknown number of'} of ${st.backup.length} songs, so nothing was removed from Liked Songs.`);
+    st.verified = true; save();
+    push(`Backup checked: all ${plural(st.backup.length, 'song')} are in ‘${st.backupName}’.`, 'ok');
+  }
+  tick();
+  for (let i = st.removed; i < st.remove.length; i += LIB_CHUNK) {
+    const chunk = st.remove.slice(i, i + LIB_CHUNK);
+    push(`Removing from Liked Songs ${i + chunk.length}/${st.remove.length}`, undefined, true);
+    await call('DELETE', '/me/library?uris=' + encodeURIComponent(chunk.join(',')));
+    st.removed = i + chunk.length; save(); tick();
+  }
+  st.done = true; save();
+}
+// Likes the removed songs again, oldest first, so Liked Songs keeps roughly its old order.
+async function runRestoreLiked(st, call, push, setPct) {
+  const list = st.remove.slice(0, st.removed).reverse();
+  const steps = Math.ceil(list.length / LIB_CHUNK) || 1;
+  for (let i = st.restored || 0; i < list.length; i += LIB_CHUNK) {
+    const chunk = list.slice(i, i + LIB_CHUNK);
+    push(`Liking again ${i + chunk.length}/${list.length}`, undefined, true);
+    await call('PUT', '/me/library?uris=' + encodeURIComponent(chunk.join(',')));
+    st.restored = i + chunk.length; store.set('cs.unlike', st);
+    setPct(Math.round((i / LIB_CHUNK + 1) / steps * 100));
+  }
+  st.restoredAll = true; store.set('cs.unlike', st);
 }
 
 /* ---------- Sample library for the demo ---------- */
@@ -654,6 +707,16 @@ function App() {
   const [split, setSplit] = useState(() => store.get('cs.split', false));
   const [skipSrc, setSkipSrc] = useState(() => new Set(store.get('cs.skipSrc', [])));
   useEffect(() => { store.set('cs.skipSrc', [...skipSrc]); }, [skipSrc]);
+  // Collaborative playlists start unticked: other people's songs only go in when you choose them.
+  useEffect(() => {
+    if (!lib?.playlists) return;
+    const known = new Set(store.get('cs.srcKnown', []));
+    const fresh = lib.playlists.filter(p => p.collaborative && !known.has(p.id));
+    if (fresh.length) setSkipSrc(s => new Set([...s, ...fresh.map(p => p.id)]));
+    store.set('cs.srcKnown', [...known, ...fresh.map(p => p.id)]);
+  }, [lib]);
+  const [unlike, setUnlike] = useState(() => store.get('cs.unlike'));
+  const [askRescan, setAskRescan] = useState(false);
   const splitAt = 150;
   const [runKind, setRunKind] = useState('');
   const [busy, setBusy] = useState(false);
@@ -757,6 +820,45 @@ function App() {
     store.del('cs.journal'); setJournal(null); setBusy(false);
   }
 
+  // Liked songs that are safely in the new playlists. Songs that didn't go anywhere stay liked.
+  const clearable = useMemo(() => {
+    if (!lib || !journal?.finished || journal.dry || !!journal.demo !== !!demo) return null;
+    const placed = new Set(journal.placed || plan.final.filter(b => journal.created.some(c => c.key === b.key && c.added >= b.tracks.length)).flatMap(b => b.tracks.map(t => t.uri)));
+    const liked = lib.tracks.filter(t => !t.src || t.src.includes('liked'));
+    return { backup: liked.map(t => t.uri), remove: liked.filter(t => placed.has(t.uri)).map(t => t.uri) };
+  }, [lib, journal, demo, plan]);
+  async function clearLiked() {
+    const st = unlike && !unlike.done ? structuredClone(unlike) : {
+      at: new Date().toISOString(), demo,
+      backupName: `Liked Songs backup ${new Date().toLocaleDateString(undefined, { year: 'numeric', month: 'short', day: 'numeric' })}`,
+      backup: clearable.backup, remove: clearable.remove, added: 0, removed: 0,
+    };
+    if (bgWanted && !demo) keepAlive.start();
+    setLines([]); setPct(0); setBusy(true); setRunKind('clear'); setView('running');
+    push(demo ? 'Demo: nothing in a real account changes.' : 'Clearing Liked Songs. A backup playlist is made and checked first.', 'ok');
+    try {
+      await runClearLiked(st, makeCaller(api, demo), demo, push, setPct);
+      push(`Done. ${plural(st.removed, 'song')} removed from Liked Songs. They're all in your new playlists and in ‘${st.backupName}’.`, 'ok');
+    } catch (e) {
+      push(e.message, 'err');
+      push('Stopped. Progress is saved: tap “Resume clearing” to carry on, or Restore to like them again.', 'err');
+    }
+    setUnlike(store.get('cs.unlike')); setBusy(false);
+  }
+  async function restoreLiked() {
+    const st = structuredClone(unlike);
+    if (bgWanted && !st.demo) keepAlive.start();
+    setLines([]); setPct(0); setBusy(true); setRunKind('restore'); setView('running');
+    try {
+      await runRestoreLiked(st, makeCaller(api, st.demo), push, setPct);
+      push(`Done. ${plural(st.restored, 'song')} are back in Liked Songs. ‘${st.backupName}’ is still there; delete it in Spotify when you no longer need it.`, 'ok');
+      store.del('cs.unlike'); setUnlike(null);
+    } catch (e) {
+      push(e.message, 'err'); push('Stopped. Tap Restore again to carry on.', 'err'); setUnlike(store.get('cs.unlike'));
+    }
+    setBusy(false);
+  }
+
   function report() {
     const g = store.get('cs.mbgenres', {}), saved = store.get('cs.lib'), lines = debug.lines();
     const statuses = {};
@@ -771,6 +873,7 @@ function App() {
       `Settings: dryRun=${dry} genres=${lookupGenres} ownPlaylists=${includeOwn} split=${split} unsortedToPop=${unsortedToPop} off=[${[...off].join(',')}]`,
       `Saved library: ${saved ? `${saved.tracks.length} songs, ${saved.playlists.length} playlists, read ${new Date(saved.at).toISOString()}, format ${saved.v || 1}` : 'none'}`,
       `Sources skipped: ${skipSrc.size ? [...skipSrc].join(',') : 'none'}`,
+      `Liked Songs clearing: ${unlike ? `backup ${unlike.added}/${unlike.backup.length}${unlike.verified ? ' checked' : ''}, removed ${unlike.removed}/${unlike.remove.length}, restored ${unlike.restored || 0}${unlike.demo ? ' (demo)' : ''}` : 'none'}`,
       `MusicBrainz genres saved: ${Object.keys(g).length} (${Object.values(g).filter(v => !v.length).length} with no genres)`,
       `Pace: ${Math.round(store.get('cs.gap', MIN_GAP))}ms between requests · Wait until: ${bu > Date.now() ? new Date(bu).toISOString() : 'none'}`,
       plan ? `Plan: ${plan.final.map(b => `${b.name}=${b.tracks.length}`).join(', ')} · unsorted=${plan.unsorted.length} · byGenre=${plan.viaGenre}` : 'Plan: none',
@@ -901,8 +1004,18 @@ function App() {
           {!demo && lib.at && (
             <div className="flex items-center justify-between gap-3 text-sm text-muted -mt-1">
               <span>Library saved {new Date(lib.at).toLocaleString([], { dateStyle: 'medium', timeStyle: 'short' })}. Reopening the app uses this copy.</span>
-              <button onClick={() => load(false, true)} className="shrink-0 rounded-lg border border-line px-3 py-1.5 text-fg">Refresh</button>
+              <button onClick={() => setAskRescan(true)} className="shrink-0 rounded-lg border border-line px-3 py-1.5 text-fg">Refresh</button>
             </div>
+          )}
+          {askRescan && (
+            <Notice tone="warn" icon="alert">
+              <strong className="block">Read your whole library again?</strong>
+              <span className="block mb-2">This uses about {Math.ceil((lib.likedTotal ?? lib.tracks.length) / 50) + 2 + (lib.includeOwn ? lib.playlists.filter(p => p.owner?.id === lib.me.id || p.collaborative).length : 0)} Spotify requests and can take a while. Genres already found are kept, and your choices stay as they are.</span>
+              <div className="grid grid-cols-2 gap-2">
+                <Btn kind="ghost" className="py-2" onClick={() => setAskRescan(false)}>Cancel</Btn>
+                <Btn className="py-2" onClick={() => { setAskRescan(false); load(false, true); }}>Read again</Btn>
+              </div>
+            </Notice>
           )}
 
           <Panel className="flex flex-col gap-3">
@@ -940,8 +1053,10 @@ function App() {
 
           <SourcePicker lib={lib} skipSrc={skipSrc} setSkipSrc={setSkipSrc} />
 
+          {(unlike || clearable) && <ClearLikedPanel unlike={unlike} clearable={clearable} onClear={clearLiked} onRestore={restoreLiked} />}
+
           {hasUndo && (
-            <UndoPanel journal={journal} onUndo={undo}
+            <UndoPanel journal={journal} onUndo={undo} blocked={unlike && unlike.removed > 0 && !unlike.restoredAll}
               copy={() => copyText(JSON.stringify(journal, null, 2), setCopyMsg)} copyMsg={copyMsg} />
           )}
 
@@ -975,7 +1090,7 @@ function App() {
           <div className="flex items-center justify-between gap-2">
             <h2 className="flex items-center gap-2 text-lg font-bold">
               {busy ? <Icon name="loader" className="w-5 h-5 spin text-accent" /> : <Icon name="check" className="w-5 h-5 text-ok" />}
-              {runKind === 'undo' ? 'Undoing' : runKind === 'dry' ? 'Dry run' : 'Automation'}{busy ? '…' : ' finished'}
+              {{ undo: 'Undoing', dry: 'Dry run', clear: 'Clearing Liked Songs', restore: 'Restoring Liked Songs' }[runKind] || 'Automation'}{busy ? '…' : ' finished'}
             </h2>
             <span className="num font-semibold">{pct}%</span>
           </div>
@@ -1008,8 +1123,10 @@ function App() {
           {!busy && (
             <div className="flex flex-col gap-2">
               <Btn kind="ghost" onClick={() => setView(lib ? 'dashboard' : 'welcome')} className="w-full">Back to the plan</Btn>
-              {hasUndo && runKind !== 'undo' && (
-                <UndoPanel journal={journal} onUndo={undo}
+              {runKind === 'run' && clearable && !unlike && <ClearLikedPanel clearable={clearable} onClear={clearLiked} />}
+              {(runKind === 'clear' || runKind === 'restore') && unlike && <ClearLikedPanel unlike={unlike} clearable={clearable} onClear={clearLiked} onRestore={restoreLiked} />}
+              {hasUndo && runKind === 'run' && (
+                <UndoPanel journal={journal} onUndo={undo} blocked={unlike && unlike.removed > 0 && !unlike.restoredAll}
                   copy={() => copyText(JSON.stringify(journal, null, 2), setCopyMsg)} copyMsg={copyMsg} />
               )}
             </div>
@@ -1032,7 +1149,7 @@ function SourcePicker({ lib, skipSrc, setSkipSrc }) {
   const mine = lib.playlists.filter(p => p.owner?.id === me && !p.collaborative);
   const shared = lib.playlists.filter(p => p.collaborative);
   const others = lib.playlists.filter(p => p.owner?.id !== me && !p.collaborative);
-  const pickable = p => p.owner?.id === me && p.read;
+  const pickable = p => !!p.read;
   const ids = ['liked', ...lib.playlists.filter(pickable).map(p => p.id)];
   const using = ids.filter(id => !skipSrc.has(id)).length;
   const toggle = (id, on) => setSkipSrc(s => { const n = new Set(s); on ? n.delete(id) : n.add(id); return n; });
@@ -1082,7 +1199,7 @@ function SourcePicker({ lib, skipSrc, setSkipSrc }) {
       </label>
       {!lib.includeOwn && <p className="text-xs text-muted">Turn on “Read songs from my own playlists” on the start screen to choose your playlists too.</p>}
       <Group title="Your playlists" list={mine} open={mine.length <= 30} />
-      <Group title="Shared with other people" hint="Collaborative playlists: other people can add or remove songs. You can sort the ones you own." list={shared} />
+      <Group title="Shared with other people" hint="Collaborative playlists: other people can add or remove songs. These start unticked, so their songs are only used if you tick them. A lock means Spotify wouldn't let Crate Sorter read it." list={shared} />
       <Group title="Made by other people" hint="Playlists you follow. Spotify doesn't let apps read their songs, so they can't be used." list={others} open={false} />
       <p className="text-xs text-muted">Spotify doesn't tell apps who follows your playlists or whether you've shared a link, so playlists can only be marked by owner, collaborative and public.</p>
     </Panel>
@@ -1111,16 +1228,57 @@ function TroublePanel({ report }) {
   );
 }
 
-function UndoPanel({ journal, onUndo, copy, copyMsg, needsLogin }) {
+function ClearLikedPanel({ unlike, clearable, onClear, onRestore }) {
+  const [typed, setTyped] = useState('');
+  if (unlike && (unlike.done || unlike.removed > 0 || unlike.backupId)) {
+    const when = new Date(unlike.at).toLocaleString([], { dateStyle: 'medium', timeStyle: 'short' });
+    const restoring = unlike.restored > 0 && !unlike.restoredAll;
+    return (
+      <Panel className="flex flex-col gap-2">
+        <div className="flex items-center gap-2"><Icon name="heart" className="w-5 h-5 text-accent" /><h2 className="text-lg font-bold">Liked Songs {unlike.done ? 'cleared' : unlike.removed ? 'partly cleared' : 'not cleared yet'}</h2></div>
+        <p className="text-sm text-muted">
+          {when}{unlike.demo ? ' (sample library)' : ''}: {unlike.removed} of {plural(unlike.remove.length, 'song')} removed.
+          {unlike.verified ? ` Every liked song is saved in the private playlist ‘${unlike.backupName}’.` : ` The backup playlist ‘${unlike.backupName}’ isn't complete yet, so nothing has been removed.`}
+          {restoring && ` Restore stopped after ${unlike.restored}.`}
+        </p>
+        <div className={'grid gap-2 ' + (unlike.done ? 'grid-cols-1' : 'grid-cols-2')}>
+          {!unlike.done && <Btn kind="danger" onClick={onClear}><Icon name="play" />Resume clearing</Btn>}
+          <Btn kind="ghost" onClick={onRestore} disabled={!unlike.removed}><Icon name="undo" />Restore Liked Songs</Btn>
+        </div>
+      </Panel>
+    );
+  }
+  if (!clearable) return null;
+  const kept = clearable.backup.length - clearable.remove.length;
+  return (
+    <Panel className="flex flex-col gap-2">
+      <div className="flex items-center gap-2"><Icon name="heart" className="w-5 h-5 text-accent" /><h2 className="text-lg font-bold">Clear Liked Songs (optional)</h2></div>
+      <p className="text-sm text-muted">
+        Removes the {plural(clearable.remove.length, 'liked song')} that are now in your new playlists.
+        {kept > 0 && ` ${plural(kept, 'song')} that didn't go into a new playlist stay liked.`}
+      </p>
+      <p className="text-sm text-muted">First it saves every liked song to a private “Liked Songs backup” playlist and checks it. Nothing is removed unless the backup is complete, and Restore likes them all again.</p>
+      {clearable.remove.length > 0 && (<>
+        <label htmlFor="clearok" className="text-sm">Type <strong>clear</strong> to confirm</label>
+        <input id="clearok" value={typed} onChange={e => setTyped(e.target.value)} autoCapitalize="off" autoComplete="off"
+          className="rounded-lg border border-line bg-bg px-3 py-2 text-base" placeholder="clear" />
+        <Btn kind="danger" disabled={typed.trim().toLowerCase() !== 'clear'} onClick={onClear}><Icon name="heart" />Clear {plural(clearable.remove.length, 'liked song')}</Btn>
+      </>)}
+    </Panel>
+  );
+}
+
+function UndoPanel({ journal, onUndo, copy, copyMsg, needsLogin, blocked }) {
   const when = new Date(journal.at).toLocaleString([], { dateStyle: 'medium', timeStyle: 'short' });
   return (
     <Panel className="flex flex-col gap-2">
       <div className="flex items-center gap-2"><Icon name="undo" className="w-5 h-5 text-accent" /><h2 className="text-lg font-bold">Undo last run</h2></div>
       <p className="text-sm text-muted">{when}{journal.demo ? ' (sample library)' : ''}: {plural(journal.created.length, 'playlist')} created. Undo removes only these.</p>
       {needsLogin && <p className="text-sm text-warn">Connect again first, so Crate Sorter can remove them.</p>}
+      {blocked && <p className="text-sm text-warn">Your liked songs were cleared and now live in these playlists. Restore Liked Songs first, then you can undo.</p>}
       <div className="grid grid-cols-2 gap-2">
         <Btn kind="ghost" onClick={copy}><Icon name="copy" />Copy record</Btn>
-        <Btn kind="danger" onClick={onUndo} disabled={needsLogin}><Icon name="undo" />Undo</Btn>
+        <Btn kind="danger" onClick={onUndo} disabled={needsLogin || blocked}><Icon name="undo" />Undo</Btn>
       </div>
       {copyMsg && <span className="text-xs text-muted">{copyMsg}</span>}
     </Panel>
