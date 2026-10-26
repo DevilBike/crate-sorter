@@ -100,7 +100,7 @@ const REDIRECT = location.origin + location.pathname;
 const API = 'https://api.spotify.com/v1';
 const MIN_GAP = 600; // ms between Spotify requests. Slow on purpose: fewer bursts, fewer 429s.
 const IN_PREVIEW = (() => { try { return window.self !== window.top; } catch { return true; } })();
-const APP_VERSION = '2026-10-26.6';
+const APP_VERSION = '2026-10-26.7';
 try { localStorage.removeItem('cs.genres'); } catch {}
 
 // Ten buckets. kw = words matched against artist genres, title = words matched against song/album names.
@@ -165,6 +165,44 @@ const shortPath = url => url.replace('https://api.spotify.com/v1', '').replace(/
 window.addEventListener('error', e => debug.add('JS', `${e.message} at ${e.filename?.split('/').pop()}:${e.lineno}`));
 window.addEventListener('unhandledrejection', e => debug.add('JS', 'Unhandled: ' + (e.reason?.message || e.reason)));
 document.addEventListener('visibilitychange', () => debug.add('PAGE', document.hidden ? 'went to background' : 'back in front'));
+
+// Background mode: Android browsers freeze pages you leave, but not pages playing audio.
+// So while the app works it plays a looping, inaudible sound (a -84 dB tone) and shows a media notification.
+const keepAlive = (() => {
+  let audio = null, onChange = () => {};
+  function wavUrl() {
+    const rate = 8000, n = rate * 2, buf = new ArrayBuffer(44 + n * 2), v = new DataView(buf);
+    const w = (o, str) => [...str].forEach((c, i) => v.setUint8(o + i, c.charCodeAt(0)));
+    w(0, 'RIFF'); v.setUint32(4, 36 + n * 2, true); w(8, 'WAVE'); w(12, 'fmt '); v.setUint32(16, 16, true);
+    v.setUint16(20, 1, true); v.setUint16(22, 1, true); v.setUint32(24, rate, true); v.setUint32(28, rate * 2, true);
+    v.setUint16(32, 2, true); v.setUint16(34, 16, true); w(36, 'data'); v.setUint32(40, n * 2, true);
+    for (let i = 0; i < n; i++) v.setInt16(44 + i * 2, i % 2 ? 2 : -2, true);
+    return URL.createObjectURL(new Blob([buf], { type: 'audio/wav' }));
+  }
+  return {
+    get on() { return !!audio && !audio.paused; },
+    listen(fn) { onChange = fn; },
+    start() {
+      if (!audio) {
+        audio = new Audio(wavUrl()); audio.loop = true;
+        audio.addEventListener('pause', () => { debug.add('PAGE', 'background mode off'); onChange(false); });
+        audio.addEventListener('playing', () => onChange(true));
+      }
+      if (!audio.paused) return Promise.resolve(true);
+      // play() is called synchronously so it counts as part of the tap that started it.
+      return audio.play().then(() => {
+        debug.add('PAGE', 'background mode on');
+        if ('mediaSession' in navigator) {
+          navigator.mediaSession.metadata = new MediaMetadata({ title: 'Crate Sorter is working', artist: 'Sorting your Spotify library' });
+          navigator.mediaSession.playbackState = 'playing';
+          navigator.mediaSession.setActionHandler('pause', () => audio.pause());
+        }
+        return true;
+      }).catch(e => { debug.add('PAGE', 'background mode needs a tap: ' + e.message); return false; });
+    },
+    stop() { if (audio && !audio.paused) audio.pause(); if ('mediaSession' in navigator) navigator.mediaSession.playbackState = 'none'; },
+  };
+})();
 
 const esc = s => s.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
 const wordRe = {};
@@ -573,6 +611,12 @@ function App() {
   const [busy, setBusy] = useState(false);
   const loadingRef = useRef(false);
   const working = view === 'loading' || busy;
+  const [bgOn, setBgOn] = useState(false);
+  const [bgWanted, setBgWanted] = useState(() => store.get('cs.background', true));
+  useEffect(() => { keepAlive.listen(setBgOn); }, []);
+  useEffect(() => { store.set('cs.background', bgWanted); }, [bgWanted]);
+  useEffect(() => { if (!working) keepAlive.stop(); }, [working]);
+  const startBackground = () => { setBgWanted(true); keepAlive.start(); };
 
   // Keep the screen on while working: Android browsers pause or reload pages that go to the background.
   useEffect(() => {
@@ -604,6 +648,7 @@ function App() {
   useEffect(() => { store.set('cs.includeOwn', includeOwn); store.set('cs.lookupGenres', lookupGenres); }, [includeOwn, lookupGenres]);
 
   async function load(isDemo, refresh = false) {
+    if (!isDemo && refresh && bgWanted) keepAlive.start();
     if (loadingRef.current) return debug.add('LOG', 'Ignored a second load while one is running');
     loadingRef.current = true;
     setErr(''); setLines([]); setView('loading'); setDemo(isDemo);
@@ -640,6 +685,7 @@ function App() {
   function signOut() { store.del('cs.tok'); setLib(null); setDemo(false); setView('welcome'); }
 
   async function execute() {
+    if (bgWanted && !dry) keepAlive.start();
     setConfirming(false); setLines([]); setPct(0); setBusy(true); setRunKind(dry ? 'dry' : 'run'); setView('running');
     const call = makeCaller(api, demo || dry);
     push(dry ? 'Dry run: nothing in your Spotify account will change.' : demo ? 'Demo run with the sample library.' : 'Starting. Only new playlists will be created.', 'ok');
@@ -761,8 +807,20 @@ function App() {
       {view === 'loading' && (
         <Panel className="flex flex-col gap-3">
           <div className="flex items-center gap-2 font-semibold"><Icon name="loader" className="w-5 h-5 spin text-accent" />Reading your library</div>
-          <p className="text-sm text-muted">The first genre lookup takes a while for a big library (about 1 artist a second). The screen stays on while this runs. Leave this page in front, ideally plugged in. If you leave, progress is saved and it carries on when you come back.</p>
+          <p className="text-sm text-muted">The first genre lookup takes a while for a big library (about 1 artist a second). Progress is saved as it goes, so nothing is lost if it stops.</p>
           <Log lines={lines} />
+          {!demo && (bgOn ? (
+            <Notice tone="ok" icon="check">
+              <strong className="block">Background mode is on</strong>
+              You can lock your phone or use other apps. A “Crate Sorter is working” media notification shows until it finishes. Pausing it there turns background mode off.
+            </Notice>
+          ) : (
+            <Notice tone="warn" icon="alert">
+              <strong className="block">This stops if you leave the page</strong>
+              <span className="block mb-2">Tap below to keep it working while your phone is locked or you use other apps.</span>
+              <Btn kind="ghost" className="w-full py-2" onClick={startBackground}><Icon name="play" />Keep working in the background</Btn>
+            </Notice>
+          ))}
         </Panel>
       )}
 
@@ -876,6 +934,20 @@ function App() {
           </div>
           <Progress pct={pct} />
           <Log lines={lines} />
+          {busy && runKind !== 'dry' && (<>
+          {!demo && (bgOn ? (
+            <Notice tone="ok" icon="check">
+              <strong className="block">Background mode is on</strong>
+              You can lock your phone or use other apps. A “Crate Sorter is working” media notification shows until it finishes. Pausing it there turns background mode off.
+            </Notice>
+          ) : (
+            <Notice tone="warn" icon="alert">
+              <strong className="block">This stops if you leave the page</strong>
+              <span className="block mb-2">Tap below to keep it working while your phone is locked or you use other apps.</span>
+              <Btn kind="ghost" className="w-full py-2" onClick={startBackground}><Icon name="play" />Keep working in the background</Btn>
+            </Notice>
+          ))}
+          </>)}
           {!busy && (
             <div className="flex flex-col gap-2">
               <Btn kind="ghost" onClick={() => setView(lib ? 'dashboard' : 'welcome')} className="w-full">Back to the plan</Btn>
