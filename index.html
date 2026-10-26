@@ -1,0 +1,754 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
+<meta name="theme-color" content="#0e6b66">
+</head>
+<body>
+<title>Crate Sorter</title>
+<meta name="claude:viewport-fit-sides" content="cover">
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+<link rel="stylesheet" href="https://fonts.googleapis.com/css2?family=Bricolage+Grotesque:opsz,wght@12..96,500;12..96,700&family=IBM+Plex+Sans:wght@400;500;600&family=IBM+Plex+Mono:wght@400;500&display=swap">
+<style>
+  /* Layout: one phone-width column of stacked panels, with a sticky action bar at the bottom. */
+  :root {
+    --bg: #eef1f3; --surface: #ffffff; --line: #d5dce1; --fg: #121a21; --muted: #56646e;
+    --accent: #0e6b66; --accent-fg: #ffffff; --warn: #8f5400; --ok: #1d7a3a; --danger: #b42318;
+    --font-display: "Bricolage Grotesque", "Segoe UI", system-ui, sans-serif;
+    --font-body: "IBM Plex Sans", system-ui, -apple-system, "Segoe UI", Roboto, sans-serif;
+    --font-mono: "IBM Plex Mono", ui-monospace, "SFMono-Regular", Menlo, monospace;
+  }
+  @media (prefers-color-scheme: dark) {
+    :root:not([data-theme="light"]) {
+      --bg: #0e1418; --surface: #162026; --line: #2a3840; --fg: #e6edf0; --muted: #98a8b2;
+      --accent: #43c3b4; --accent-fg: #04201d; --warn: #f2b049; --ok: #5fd08a; --danger: #ff7a6b;
+      color-scheme: dark;
+    }
+  }
+  :root[data-theme="dark"] {
+    --bg: #0e1418; --surface: #162026; --line: #2a3840; --fg: #e6edf0; --muted: #98a8b2;
+    --accent: #43c3b4; --accent-fg: #04201d; --warn: #f2b049; --ok: #5fd08a; --danger: #ff7a6b;
+    color-scheme: dark;
+  }
+  html, body { background: var(--bg); color: var(--fg); }
+  body { font-family: var(--font-body); font-size: 15px; line-height: 1.5;
+    padding-left: max(16px, env(safe-area-inset-left, 0px)); padding-right: max(16px, env(safe-area-inset-right, 0px)); }
+  h1, h2, h3 { font-family: var(--font-display); text-wrap: balance; }
+  .num { font-variant-numeric: tabular-nums; }
+  .eyebrow { font-size: 11px; letter-spacing: .08em; text-transform: uppercase; color: var(--muted); font-weight: 600; }
+  :focus-visible { outline: 2px solid var(--accent); outline-offset: 2px; }
+  .spin { animation: spin 1s linear infinite; }
+  @keyframes spin { to { transform: rotate(360deg); } }
+  @media (prefers-reduced-motion: reduce) { .spin { animation: none; } * { transition: none !important; } }
+  details > summary { list-style: none; cursor: pointer; }
+  details > summary::-webkit-details-marker { display: none; }
+  #boot { max-width: 36rem; margin: 0 auto; padding-block: 48px; color: var(--muted); }
+</style>
+
+<div id="root"><div id="boot">Loading Crate Sorter…</div></div>
+
+<script src="https://cdn.tailwindcss.com/3.4.17"></script>
+<script>
+  tailwind.config = {
+    corePlugins: { preflight: true },
+    theme: { extend: {
+      colors: { bg: 'var(--bg)', surface: 'var(--surface)', line: 'var(--line)', fg: 'var(--fg)', muted: 'var(--muted)',
+        accent: 'var(--accent)', 'accent-fg': 'var(--accent-fg)', warn: 'var(--warn)', ok: 'var(--ok)', danger: 'var(--danger)' },
+      fontFamily: { display: 'var(--font-display)', body: 'var(--font-body)', mono: 'var(--font-mono)' },
+    } },
+  };
+</script>
+<script src="https://cdnjs.cloudflare.com/ajax/libs/react/18.3.1/umd/react.production.min.js"></script>
+<script src="https://cdnjs.cloudflare.com/ajax/libs/react-dom/18.3.1/umd/react-dom.production.min.js"></script>
+<script src="https://cdnjs.cloudflare.com/ajax/libs/babel-standalone/7.23.5/babel.min.js"></script>
+
+<script type="text/babel" data-presets="react">
+const { useState, useEffect, useRef, useMemo } = React;
+
+/* ---------- Lucide icons (path data inlined from lucide.dev, so nothing extra has to load) ---------- */
+const ICONS = {
+  music: [['path', { d: 'M9 18V5l12-2v13' }], ['circle', { cx: 6, cy: 18, r: 3 }], ['circle', { cx: 18, cy: 16, r: 3 }]],
+  shield: [['path', { d: 'M12 22s8-4 8-10V5l-8-3-8 3v7c0 6 8 10 8 10z' }]],
+  play: [['polygon', { points: '6 3 20 12 6 21 6 3' }]],
+  check: [['path', { d: 'M20 6 9 17l-5-5' }]],
+  loader: [['path', { d: 'M21 12a9 9 0 1 1-6.219-8.56' }]],
+  undo: [['path', { d: 'M3 12a9 9 0 1 0 9-9 9.75 9.75 0 0 0-6.74 2.74L3 8' }], ['path', { d: 'M3 3v5h5' }]],
+  alert: [['path', { d: 'm21.73 18-8-14a2 2 0 0 0-3.48 0l-8 14A2 2 0 0 0 4 21h16a2 2 0 0 0 1.73-3' }], ['path', { d: 'M12 9v4' }], ['path', { d: 'M12 17h.01' }]],
+  logout: [['path', { d: 'M9 21H5a2 2 0 0 1-2-2V5a2 2 0 0 1 2-2h4' }], ['polyline', { points: '16 17 21 12 16 7' }], ['line', { x1: 21, y1: 12, x2: 9, y2: 12 }]],
+  list: [['path', { d: 'M21 15V6' }], ['path', { d: 'M18.5 18a2.5 2.5 0 1 0 0-5 2.5 2.5 0 0 0 0 5Z' }], ['path', { d: 'M12 12H3' }], ['path', { d: 'M16 6H3' }], ['path', { d: 'M12 18H3' }]],
+  copy: [['rect', { width: 14, height: 14, x: 8, y: 8, rx: 2 }], ['path', { d: 'M4 16c-1.1 0-2-.9-2-2V4c0-1.1.9-2 2-2h10c1.1 0 2 .9 2 2' }]],
+  eye: [['path', { d: 'M2 12s3-7 10-7 10 7 10 7-3 7-10 7-10-7-10-7Z' }], ['circle', { cx: 12, cy: 12, r: 3 }]],
+  x: [['path', { d: 'M18 6 6 18' }], ['path', { d: 'm6 6 12 12' }]],
+  lock: [['rect', { width: 18, height: 11, x: 3, y: 11, rx: 2 }], ['path', { d: 'M7 11V7a5 5 0 0 1 10 0v4' }]],
+  chevron: [['path', { d: 'm6 9 6 6 6-6' }]],
+};
+function Icon({ name, className = 'w-4 h-4' }) {
+  return (
+    <svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2"
+      strokeLinecap="round" strokeLinejoin="round" className={'shrink-0 ' + className} aria-hidden="true">
+      {ICONS[name].map(([tag, attrs], i) => React.createElement(tag, { key: i, ...attrs }))}
+    </svg>
+  );
+}
+
+/* ---------- Config ---------- */
+// Read access to your library, plus permission to create private playlists (and remove only those, on undo).
+const SCOPES = 'playlist-read-private playlist-read-collaborative playlist-modify-private user-library-read user-library-modify';
+const REDIRECT = location.origin + location.pathname;
+const API = 'https://api.spotify.com/v1';
+const POST_DELAY = 200;
+const IN_PREVIEW = (() => { try { return window.self !== window.top; } catch { return true; } })();
+
+// Ten buckets. kw = words matched against artist genres, title = words matched against song/album names.
+const BUCKETS = [
+  { key: 'chill', name: 'Chill', hue: 185, blurb: 'Lo-fi, downtempo, dream pop',
+    kw: ['chill', 'lo-fi', 'lofi', 'chillhop', 'jazz hop', 'downtempo', 'trip hop', 'bedroom pop', 'dream pop', 'chillwave', 'sleep', 'lounge', 'bossa nova'],
+    title: ['lofi', 'lo-fi', 'chill', 'sleep', 'rain', 'calm', 'slowed'] },
+  { key: 'energy', name: 'High Energy', hue: 0, blurb: 'Metal, punk, drum & bass, phonk',
+    kw: ['metal', 'punk', 'hardcore', 'hardstyle', 'drum and bass', 'dnb', 'grime', 'drill', 'phonk', 'big room', 'hyperpop', 'thrash', 'nu metal', 'metalcore'],
+    title: ['workout', 'hype', 'rage', 'sped up'] },
+  { key: 'acoustic', name: 'Acoustic', hue: 30, blurb: 'Folk, country, singer-songwriter',
+    kw: ['folk', 'acoustic', 'singer-songwriter', 'country', 'bluegrass', 'americana', 'indie folk', 'folk rock'],
+    title: ['acoustic', 'unplugged', 'stripped'] },
+  { key: 'focus', name: 'Focus', hue: 225, blurb: 'Classical, ambient, scores, jazz',
+    kw: ['classical', 'ambient', 'instrumental', 'soundtrack', 'score', 'piano', 'neoclassical', 'jazz', 'post-rock', 'orchestra', 'baroque', 'new age', 'minimalism', 'classical piano'],
+    title: ['piano', 'instrumental', 'op.', 'sonata', 'concerto', 'étude', 'prelude', 'nocturne', 'symphony', 'main theme'] },
+  { key: 'electronic', name: 'Electronic', hue: 270, blurb: 'House, techno, trance, garage',
+    kw: ['house', 'techno', 'electro', 'edm', 'trance', 'dubstep', 'electronic', 'electronica', 'synthwave', 'uk garage', 'idm', 'french house', 'deep house', 'breakbeat'],
+    title: ['extended mix', 'club mix', 'vip mix', 'remix'] },
+  { key: 'hiphop', name: 'Hip-Hop & R&B', hue: 48, blurb: 'Rap, trap, R&B, soul',
+    kw: ['hip hop', 'rap', 'trap', 'r&b', 'soul', 'neo soul', 'boom bap', 'funk', 'west coast rap', 'alternative r&b', 'gangster rap'],
+    title: ['freestyle', 'cypher'] },
+  { key: 'rock', name: 'Rock & Alt', hue: 340, blurb: 'Indie, alternative, grunge',
+    kw: ['rock', 'alternative', 'indie', 'grunge', 'shoegaze', 'emo', 'garage rock', 'britpop', 'post-punk', 'new wave', 'indie rock'],
+    title: [] },
+  { key: 'pop', name: 'Pop', hue: 305, weight: 0.6, blurb: 'Chart pop, dance pop, art pop',
+    kw: ['pop', 'dance pop', 'art pop', 'electropop', 'teen pop', 'synthpop'],
+    title: [] },
+  { key: 'global', name: 'Latin & Global', hue: 140, blurb: 'Reggaeton, Afrobeats, K-pop',
+    kw: ['latin', 'reggaeton', 'latin trap', 'afrobeats', 'afrobeat', 'amapiano', 'k-pop', 'j-pop', 'c-pop', 'mandopop', 'bollywood', 'reggae', 'dancehall', 'salsa', 'bachata', 'cumbia', 'sertanejo', 'flamenco', 'corrido'],
+    title: [] },
+  { key: 'throwback', name: 'Throwbacks', hue: 90, blurb: 'Classic rock, Motown, disco, pre-1990',
+    kw: ['classic rock', 'oldies', 'motown', 'classic soul', 'disco', 'doo-wop', 'rock-and-roll', 'yacht rock', 'soft rock', '80s', '70s', '60s'],
+    title: ['remaster'] },
+];
+const POP = BUCKETS.findIndex(b => b.key === 'pop');
+const dot = h => `hsl(${h} 62% 48%)`;
+const tint = h => `hsl(${h} 60% 50% / 0.14)`;
+
+/* ---------- Small helpers ---------- */
+const sleep = ms => new Promise(r => setTimeout(r, ms));
+const store = {
+  get(k, d = null) { try { const v = localStorage.getItem(k); return v == null ? d : JSON.parse(v); } catch { return d; } },
+  set(k, v) { try { localStorage.setItem(k, JSON.stringify(v)); } catch {} },
+  del(k) { try { localStorage.removeItem(k); } catch {} },
+};
+const esc = s => s.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
+const wordRe = {};
+const matchWord = (text, k) => (wordRe[k] ||= new RegExp('(^|[\\s\\-/(])' + esc(k) + '($|[\\s\\-/)])')).test(text);
+const plural = (n, w) => `${n.toLocaleString()} ${w}${n === 1 ? '' : 's'}`;
+
+/* ---------- Spotify auth: Authorization Code with PKCE (Implicit Grant was removed in Nov 2025) ---------- */
+const b64url = buf => btoa(String.fromCharCode(...new Uint8Array(buf))).replace(/\+/g, '-').replace(/\//g, '_').replace(/=+$/, '');
+async function startLogin(clientId) {
+  const verifier = b64url(crypto.getRandomValues(new Uint8Array(64)));
+  const challenge = b64url(await crypto.subtle.digest('SHA-256', new TextEncoder().encode(verifier)));
+  const state = b64url(crypto.getRandomValues(new Uint8Array(16)));
+  store.set('cs.pkce', { verifier, state });
+  const p = new URLSearchParams({ client_id: clientId, response_type: 'code', redirect_uri: REDIRECT,
+    code_challenge_method: 'S256', code_challenge: challenge, scope: SCOPES, state });
+  location.assign('https://accounts.spotify.com/authorize?' + p);
+}
+async function tokenRequest(params) {
+  const r = await fetch('https://accounts.spotify.com/api/token', { method: 'POST',
+    headers: { 'Content-Type': 'application/x-www-form-urlencoded' }, body: new URLSearchParams(params) });
+  const j = await r.json().catch(() => ({}));
+  if (!r.ok) throw new Error(j.error_description || j.error || `Spotify refused the sign-in (${r.status}).`);
+  const tok = { access: j.access_token, refresh: j.refresh_token || store.get('cs.tok')?.refresh, exp: Date.now() + (j.expires_in - 60) * 1000 };
+  store.set('cs.tok', tok);
+  return tok;
+}
+async function finishLogin(clientId) {
+  const q = new URLSearchParams(location.search);
+  if (!q.get('code') && !q.get('error')) return false;
+  history.replaceState(null, '', REDIRECT);
+  if (q.get('error')) throw new Error(`Spotify sign-in was cancelled (${q.get('error')}).`);
+  const pk = store.get('cs.pkce');
+  store.del('cs.pkce');
+  if (!pk || pk.state !== q.get('state')) throw new Error('The sign-in check did not match. Tap Connect again.');
+  await tokenRequest({ grant_type: 'authorization_code', code: q.get('code'), redirect_uri: REDIRECT, client_id: clientId, code_verifier: pk.verifier });
+  return true;
+}
+
+/* ---------- API client with refresh, 429 back-off and retries ---------- */
+function makeApi(clientId, onWait) {
+  async function token() {
+    let t = store.get('cs.tok');
+    if (!t) throw new Error('You are not signed in.');
+    if (Date.now() > t.exp) {
+      if (!t.refresh) throw new Error('Your Spotify session expired. Connect again.');
+      t = await tokenRequest({ grant_type: 'refresh_token', refresh_token: t.refresh, client_id: clientId });
+    }
+    return t.access;
+  }
+  async function call(method, path, body, tries = 0) {
+    const url = path.startsWith('http') ? path : API + path;
+    const r = await fetch(url, { method, body: body ? JSON.stringify(body) : undefined,
+      headers: { Authorization: 'Bearer ' + await token(), ...(body ? { 'Content-Type': 'application/json' } : {}) } });
+    if (r.status === 429 && tries < 6) {
+      const s = Number(r.headers.get('Retry-After')) || 2 ** tries;
+      onWait?.(s); await sleep(s * 1000 + 250); return call(method, path, body, tries + 1);
+    }
+    if (r.status >= 500 && tries < 3) { await sleep(1000 * (tries + 1)); return call(method, path, body, tries + 1); }
+    if (r.status === 401 && tries < 1) { const t = store.get('cs.tok'); if (t) store.set('cs.tok', { ...t, exp: 0 }); return call(method, path, body, tries + 1); }
+    const txt = await r.text();
+    let j = null; try { j = txt ? JSON.parse(txt) : null; } catch {}
+    if (!r.ok) {
+      const e = new Error(`${method} ${url.replace(API, '').split('?')[0]} failed (${r.status}): ${j?.error?.message || txt || r.statusText}`);
+      e.status = r.status; throw e;
+    }
+    return j;
+  }
+  async function all(path, onPage) {
+    const out = []; let next = path;
+    while (next) { const j = await call('GET', next); out.push(...(j.items || [])); onPage?.(out.length, j.total); next = j.next; }
+    return out;
+  }
+  return { call, all };
+}
+
+// Feb 2026: playlist rows moved from row.track to row.item (row.track can now be a boolean).
+function rowTrack(row) {
+  const t = (row && typeof row.item === 'object' && row.item) || (row && typeof row.track === 'object' && row.track) || null;
+  if (!t || !t.id || t.is_local || (t.type && t.type !== 'track')) return null;
+  return { id: t.id, uri: t.uri || 'spotify:track:' + t.id, name: t.name || '', album: t.album?.name || '',
+    year: parseInt(t.album?.release_date, 10) || null, artists: (t.artists || []).filter(a => a.id).map(a => ({ id: a.id, name: a.name })) };
+}
+
+async function loadLibrary(api, { includeOwn }, log) {
+  const me = await api.call('GET', '/me');
+  log(`Signed in as ${me.display_name || me.id}`);
+  const playlists = await api.all('/me/playlists?limit=50', n => log(`Found ${plural(n, 'playlist')}`, true));
+  const saved = await api.all('/me/tracks?limit=50', (n, t) => log(`Reading Liked Songs ${n}/${t}`, true));
+  let tracks = saved.map(rowTrack).filter(Boolean);
+  if (includeOwn) {
+    const own = playlists.filter(p => p.owner?.id === me.id && !p.collaborative);
+    for (const [i, p] of own.entries()) {
+      log(`Reading “${p.name}” (${i + 1}/${own.length})`, true);
+      const rows = await api.all(`/playlists/${p.id}/items?limit=50`);
+      tracks.push(...rows.map(rowTrack).filter(Boolean));
+    }
+  }
+  const seen = new Set(); tracks = tracks.filter(t => !seen.has(t.id) && seen.add(t.id));
+  log(`${plural(tracks.length, 'unique song')} to sort`);
+
+  // The batch GET /artists endpoint was removed in Feb 2026, so genres come one artist at a time (cached).
+  const cache = store.get('cs.genres', {});
+  const ids = [...new Set(tracks.flatMap(t => t.artists.map(a => a.id)))];
+  const todo = ids.filter(id => !(id in cache));
+  let done = ids.length - todo.length;
+  await Promise.all(Array.from({ length: 3 }, async () => {
+    while (todo.length) {
+      const id = todo.shift();
+      try { const a = await api.call('GET', '/artists/' + id); cache[id] = a.genres || []; }
+      catch (e) { if (e.status === 400 || e.status === 404 || e.status === 403) cache[id] = []; else throw e; }
+      if (++done % 10 === 0 || !todo.length) { log(`Reading artist genres ${done}/${ids.length}`, true); store.set('cs.genres', cache); }
+    }
+  }));
+  store.set('cs.genres', cache);
+  return { me, playlists, tracks, genres: cache };
+}
+
+/* ---------- Classification ---------- */
+function classify(track, genres) {
+  const g = track.artists.flatMap(a => genres[a.id] || []).map(s => s.toLowerCase());
+  const text = (track.name + ' ' + track.album).toLowerCase();
+  const ranked = BUCKETS.map((b, i) => {
+    let s = 0;
+    for (const gen of g) for (const k of b.kw) if (gen === k || matchWord(gen, k)) s += b.weight || 1;
+    for (const k of b.title) if (text.includes(k)) s += 0.75;
+    if (b.key === 'throwback' && track.year && track.year < 1990) s += 1.5;
+    return [i, s];
+  }).filter(([, s]) => s > 0).sort((x, y) => y[1] - x[1] || x[0] - y[0]).map(([i]) => i);
+  return { ranked, via: g.length ? 'genre' : 'name' };
+}
+
+// Splits one big playlist into decade playlists; decades with few songs share a "Mixed years" playlist.
+function splitByDecade(b, minPart = 20) {
+  const groups = {};
+  for (const t of b.tracks) { const d = t.year ? Math.floor(t.year / 10) * 10 : 0; (groups[d] ||= []).push(t); }
+  const parts = [], mixed = [];
+  for (const [d, ts] of Object.entries(groups).sort((x, y) => x[0] - y[0])) {
+    if (Number(d) && ts.length >= minPart) parts.push({ ...b, key: b.key + d, name: `${b.name} · ${d}s`, tracks: ts, parent: b.key });
+    else mixed.push(...ts);
+  }
+  if (parts.length < 2) return [b];
+  if (mixed.length) parts.push({ ...b, key: b.key + 'mix', name: `${b.name} · Mixed years`, tracks: mixed, parent: b.key });
+  return parts;
+}
+
+function buildPlan(lib, { unsortedToPop, off, split, splitAt }) {
+  const buckets = BUCKETS.map(b => ({ ...b, tracks: [] }));
+  const unsorted = []; let viaGenre = 0;
+  for (const t of lib.tracks) {
+    const r = classify(t, lib.genres);
+    // A song whose best match is switched off goes to its next-best match that is still on.
+    const idx = r.ranked.find(i => !off.has(BUCKETS[i].key));
+    if (idx !== undefined) { buckets[idx].tracks.push(t); if (r.via === 'genre') viaGenre++; }
+    else if (unsortedToPop && !off.has('pop')) buckets[POP].tracks.push(t);
+    else unsorted.push(t);
+  }
+  const final = buckets.filter(b => !off.has(b.key) && b.tracks.length)
+    .flatMap(b => split && b.tracks.length > splitAt ? splitByDecade(b) : [b]);
+  return { buckets, final, unsorted, viaGenre };
+}
+
+/* ---------- Automation and undo ---------- */
+function makeCaller(api, simulate) {
+  return simulate ? async () => { await sleep(90); return { id: 'sim' + Math.random().toString(36).slice(2, 9) }; } : api.call;
+}
+// Existing playlists are never edited: the only writes are creating new playlists and adding songs to them.
+async function runAutomation(plan, call, dry, demo, push, setPct) {
+  const filled = plan.final;
+  const total = filled.reduce((n, b) => n + 1 + Math.ceil(b.tracks.length / 100), 0) || 1;
+  let done = 0; const tick = () => setPct(Math.round(++done / total * 100));
+  const stamp = new Date().toLocaleDateString(undefined, { year: 'numeric', month: 'short', day: 'numeric' });
+  const journal = { at: new Date().toISOString(), dry, demo, created: [] };
+  const save = () => { if (!dry) store.set('cs.journal', journal); };
+  const verb = dry ? 'Would ' : '';
+  for (const b of filled) {
+    push(`${verb}${dry ? 'create' : 'Creating'} ‘${b.name}’ playlist${dry ? '' : '…'}`);
+    const pl = await call('POST', '/me/playlists', { name: b.name, public: false, description: `${b.blurb}. Sorted by Crate Sorter on ${stamp}.` });
+    journal.created.push({ id: pl.id, name: b.name }); save(); tick(); await sleep(POST_DELAY);
+    const uris = b.tracks.map(t => t.uri);
+    for (let i = 0; i < uris.length; i += 100) {
+      const chunk = uris.slice(i, i + 100);
+      push(`${verb}${dry ? 'add' : 'Adding'} ${chunk.length} tracks to ‘${b.name}’ (${i + chunk.length}/${uris.length})`);
+      await call('POST', `/playlists/${pl.id}/items`, { uris: chunk });
+      tick(); await sleep(POST_DELAY);
+    }
+  }
+  return journal;
+}
+async function runUndo(journal, call, push, setPct) {
+  const total = journal.created.length || 1;
+  let done = 0; const tick = () => setPct(Math.round(++done / total * 100));
+  for (const c of journal.created) {
+    push(`Removing ‘${c.name}’`);
+    try { await call('DELETE', '/me/library?uris=' + encodeURIComponent('spotify:playlist:' + c.id)); }
+    catch (e) { push(`Could not remove ‘${c.name}’. Delete it in the Spotify app. (${e.message})`, 'err'); }
+    tick(); await sleep(POST_DELAY);
+  }
+}
+
+/* ---------- Sample library for the demo ---------- */
+const DEMO = (() => {
+  const A = {
+    nuj: ['Nujabes', ['jazz hop', 'lo-fi', 'chillhop']], bon: ['Bonobo', ['downtempo', 'electronica']],
+    met: ['Metallica', ['metal', 'thrash metal']], phb: ['Phoebe Bridgers', ['indie folk', 'singer-songwriter']],
+    ein: ['Ludovico Einaudi', ['neoclassical', 'classical piano']], daf: ['Daft Punk', ['french house', 'electro']],
+    ken: ['Kendrick Lamar', ['hip hop', 'west coast rap']], arc: ['Arctic Monkeys', ['indie rock', 'garage rock']],
+    dua: ['Dua Lipa', ['pop', 'dance pop']], bad: ['Bad Bunny', ['reggaeton', 'latin trap']],
+    flm: ['Fleetwood Mac', ['soft rock', 'classic rock']], sza: ['SZA', ['r&b', 'pop']],
+    fre: ['Fred again..', ['house', 'uk garage']], zim: ['Hans Zimmer', ['soundtrack', 'orchestra']],
+    bur: ['Burna Boy', ['afrobeats']], sup: ['The Supremes', ['motown', 'classic soul']],
+    nwj: ['NewJeans', ['k-pop']], zac: ['Zach Bryan', ['country', 'americana']],
+    pen: ['Pendulum', ['drum and bass']], bed: ['Quiet Room Tapes', []],
+  };
+  const T = [
+    ['Aruarian Dance', 'nuj', 2005], ['Feather', 'nuj', 2005], ['Kerala', 'bon', 2017], ['Cirrus', 'bon', 2013],
+    ['Master of Puppets', 'met', 1986], ['Enter Sandman', 'met', 1991], ['Motion Sickness', 'phb', 2017], ['Kyoto', 'phb', 2020],
+    ['Nuvole Bianche', 'ein', 2004], ['Experience', 'ein', 2013], ['One More Time', 'daf', 2001], ['Around the World', 'daf', 1997],
+    ['HUMBLE.', 'ken', 2017], ['Money Trees', 'ken', 2012], ['Not Like Us', 'ken', 2024], ['Do I Wanna Know?', 'arc', 2013],
+    ['505', 'arc', 2007], ['Levitating', 'dua', 2020], ['Houdini', 'dua', 2023], ['Tití Me Preguntó', 'bad', 2022],
+    ['DtMF', 'bad', 2025], ['Dreams', 'flm', 1977], ['The Chain', 'flm', 1977], ['Kill Bill', 'sza', 2022],
+    ['Good Days', 'sza', 2020], ['Delilah (pull me out of this)', 'fre', 2023], ['Marea (we’ve lost dancing)', 'fre', 2021],
+    ['Time', 'zim', 2010], ['Cornfield Chase', 'zim', 2014], ['Last Last', 'bur', 2022], ['On the Low', 'bur', 2018],
+    ['Baby Love', 'sup', 1964], ['Where Did Our Love Go', 'sup', 1964], ['Super Shy', 'nwj', 2023], ['Ditto', 'nwj', 2022],
+    ['Something in the Orange', 'zac', 2022], ['Tarantula', 'pen', 2006], ['Watercolour', 'pen', 2010],
+    ['Rainy Day Lofi Loop', 'bed', 2024], ['Untitled Voice Memo 4', 'bed', 2024],
+  ];
+  const genres = Object.fromEntries(Object.entries(A).map(([id, [, g]]) => [id, g]));
+  const tracks = T.map(([name, a, year], i) => ({ id: 'd' + i, uri: 'spotify:track:demo' + i, name, album: '', year, artists: [{ id: a, name: A[a][0] }] }));
+  const me = { id: 'demo', display_name: 'Sample listener' };
+  const mine = { id: 'demo' }, spotify = { id: 'spotify', display_name: 'Spotify' }, friend = { id: 'sam', display_name: 'Sam' };
+  const pl = (id, name, owner, n, collaborative = false) => ({ id, name, owner, collaborative, items: { total: n } });
+  const playlists = [
+    pl('p1', 'Summer 2023', mine, 54), pl('p2', 'Gym', mine, 38), pl('p3', 'Late night drives', mine, 71),
+    pl('p4', 'Road trip w/ Jess', mine, 120), pl('p5', 'study study study', mine, 46), pl('p6', 'wedding songs?', mine, 19),
+    pl('p7', 'Discover Weekly', spotify, 30), pl('p8', "Sam's party mix", friend, 88, true),
+    pl('p9', 'Group roadtrip', mine, 64, true), pl('p10', 'Old stuff', mine, 210), pl('p11', "Today's Top Hits", spotify, 50),
+  ];
+  return { me, playlists, tracks, genres };
+})();
+
+/* ---------- UI pieces ---------- */
+const Panel = ({ children, className = '' }) => <section className={'rounded-2xl border border-line bg-surface p-4 sm:p-5 ' + className}>{children}</section>;
+function Btn({ kind = 'primary', className = '', children, ...p }) {
+  const k = {
+    primary: 'bg-accent text-accent-fg hover:opacity-90',
+    ghost: 'border border-line text-fg hover:bg-bg',
+    danger: 'border border-danger text-danger hover:bg-bg',
+  }[kind];
+  return <button className={`inline-flex items-center justify-center gap-2 rounded-xl px-4 py-3 font-semibold transition disabled:opacity-40 disabled:cursor-not-allowed ${k} ${className}`} {...p}>{children}</button>;
+}
+function Toggle({ id, checked, onChange, label, hint }) {
+  return (
+    <label htmlFor={id} className="flex items-start gap-3 cursor-pointer py-1">
+      <input id={id} type="checkbox" className="mt-1 h-4 w-4 accent-[var(--accent)]" checked={checked} onChange={e => onChange(e.target.checked)} />
+      <span className="min-w-0"><span className="font-medium">{label}</span>{hint && <span className="block text-sm text-muted">{hint}</span>}</span>
+    </label>
+  );
+}
+function Notice({ tone = 'warn', icon = 'alert', children }) {
+  const c = { warn: 'text-warn', danger: 'text-danger', ok: 'text-ok', accent: 'text-accent' }[tone];
+  return (
+    <div className="flex gap-3 rounded-xl border border-line bg-bg p-3 text-sm">
+      <span className={c + ' pt-0.5'}><Icon name={icon} /></span><div className="min-w-0">{children}</div>
+    </div>
+  );
+}
+function BucketGrid({ buckets }) {
+  return (
+    <ul className="grid grid-cols-2 gap-2">
+      {buckets.map(b => (
+        <li key={b.key} className="flex items-center gap-2 rounded-lg px-3 py-2 text-sm" style={{ background: tint(b.hue) }}>
+          <span className="h-2.5 w-2.5 rounded-full" style={{ background: dot(b.hue) }} />
+          <span className="min-w-0"><span className="block font-semibold leading-tight">{b.name}</span><span className="block text-xs text-muted leading-tight truncate">{b.blurb}</span></span>
+        </li>
+      ))}
+    </ul>
+  );
+}
+function Log({ lines }) {
+  const ref = useRef(null);
+  useEffect(() => { if (ref.current) ref.current.scrollTop = ref.current.scrollHeight; }, [lines]);
+  return (
+    <div ref={ref} className="h-64 overflow-y-auto rounded-xl border border-line bg-bg p-3 font-mono text-[12.5px] leading-relaxed" aria-live="polite">
+      {lines.map((l, i) => <div key={i} className={l.tone === 'err' ? 'text-danger' : l.tone === 'ok' ? 'text-ok' : ''}><span className="text-muted num">{l.t} </span>{l.msg}</div>)}
+    </div>
+  );
+}
+function Progress({ pct }) {
+  return (
+    <div className="h-3 w-full overflow-hidden rounded-full bg-bg border border-line" role="progressbar" aria-valuenow={pct} aria-valuemin="0" aria-valuemax="100">
+      <div className="h-full bg-accent transition-all duration-300" style={{ width: pct + '%' }} />
+    </div>
+  );
+}
+async function copyText(text, setMsg) {
+  try { await navigator.clipboard.writeText(text); setMsg('Copied'); }
+  catch { setMsg('Copy blocked here. Select the text and copy it.'); }
+  setTimeout(() => setMsg(''), 2500);
+}
+
+/* ---------- App ---------- */
+function App() {
+  const [view, setView] = useState('welcome');
+  const [clientId, setClientId] = useState(() => store.get('cs.clientId', ''));
+  const [includeOwn, setIncludeOwn] = useState(() => store.get('cs.includeOwn', false));
+  const [demo, setDemo] = useState(false);
+  const [lib, setLib] = useState(null);
+  const [err, setErr] = useState('');
+  const [lines, setLines] = useState([]);
+  const [pct, setPct] = useState(0);
+  const [unsortedToPop, setUnsortedToPop] = useState(true);
+  const [dry, setDry] = useState(true);
+  const [confirming, setConfirming] = useState(false);
+  const [journal, setJournal] = useState(() => store.get('cs.journal'));
+  const [copyMsg, setCopyMsg] = useState('');
+  const [openBucket, setOpenBucket] = useState(null);
+  const [off, setOff] = useState(() => new Set(store.get('cs.off', [])));
+  const [split, setSplit] = useState(() => store.get('cs.split', false));
+  const splitAt = 150;
+  const [runKind, setRunKind] = useState('');
+  const [busy, setBusy] = useState(false);
+
+  const push = (msg, tone, replaceLast) => setLines(ls => {
+    const t = new Date().toLocaleTimeString([], { hour: '2-digit', minute: '2-digit', second: '2-digit' });
+    const next = replaceLast && ls.length && ls[ls.length - 1].live ? ls.slice(0, -1) : ls;
+    return [...next, { t, msg, tone, live: replaceLast }];
+  });
+  const api = useMemo(() => makeApi(clientId.trim(), s => push(`Spotify asked us to slow down. Waiting ${s}s…`, 'err')), [clientId]);
+  const plan = useMemo(() => lib && buildPlan(lib, { unsortedToPop, off, split, splitAt }), [lib, unsortedToPop, off, split]);
+  useEffect(() => { store.set('cs.off', [...off]); store.set('cs.split', split); }, [off, split]);
+
+  useEffect(() => { store.set('cs.clientId', clientId.trim()); }, [clientId]);
+  useEffect(() => { store.set('cs.includeOwn', includeOwn); }, [includeOwn]);
+
+  async function load(isDemo) {
+    setErr(''); setLines([]); setView('loading'); setDemo(isDemo);
+    try {
+      if (isDemo) {
+        push('Loading the sample library'); await sleep(400);
+        push(`Found ${plural(DEMO.playlists.length, 'playlist')}`); await sleep(300);
+        push(`Reading artist genres ${Object.keys(DEMO.genres).length}/${Object.keys(DEMO.genres).length}`); await sleep(300);
+        setLib(DEMO);
+      } else {
+        setLib(await loadLibrary(api, { includeOwn }, (m, live) => push(m, undefined, live)));
+      }
+      setView('dashboard');
+    } catch (e) { setErr(e.message); setView('welcome'); }
+  }
+
+  // Coming back from Spotify's sign-in page.
+  useEffect(() => {
+    (async () => {
+      try {
+        const id = store.get('cs.clientId', '');
+        if (await finishLogin(id)) return load(false);
+        if (store.get('cs.tok') && id) return load(false);
+      } catch (e) { setErr(e.message); }
+    })();
+  }, []);
+
+  async function connect() {
+    setErr('');
+    if (!clientId.trim()) return setErr('Paste your Client ID from the Spotify Developer Dashboard first.');
+    try { await startLogin(clientId.trim()); } catch (e) { setErr('Could not open Spotify sign-in: ' + e.message); }
+  }
+  function signOut() { store.del('cs.tok'); setLib(null); setDemo(false); setView('welcome'); }
+
+  async function execute() {
+    setConfirming(false); setLines([]); setPct(0); setBusy(true); setRunKind(dry ? 'dry' : 'run'); setView('running');
+    const call = makeCaller(api, demo || dry);
+    push(dry ? 'Dry run: nothing in your Spotify account will change.' : demo ? 'Demo run with the sample library.' : 'Starting. Only new playlists will be created.', 'ok');
+    try {
+      const j = await runAutomation(plan, call, dry, demo, m => push(m), setPct);
+      if (!dry) setJournal(j);
+      push(dry ? 'Dry run finished. Turn off “Dry run” to do it for real.' : `Done. ${plural(j.created.length, 'new playlist')} created. Your existing playlists were not changed.`, 'ok');
+    } catch (e) {
+      push(e.message, 'err');
+      push('Stopped. Everything finished so far is recorded, so you can undo it below.', 'err');
+      if (!dry) setJournal(store.get('cs.journal'));
+    }
+    setBusy(false);
+  }
+  async function undo() {
+    if (!journal) return;
+    setLines([]); setPct(0); setBusy(true); setRunKind('undo'); setView('running');
+    const j = structuredClone(journal);
+    await runUndo(j, makeCaller(api, demo || j.demo), (m, tone) => push(m, tone), setPct);
+    push('Undo finished.', 'ok');
+    store.del('cs.journal'); setJournal(null); setBusy(false);
+  }
+
+  const hasUndo = journal && journal.created && journal.created.length > 0;
+
+  return (
+    <div className="mx-auto max-w-xl pt-4 pb-32 flex flex-col gap-4">
+      <header className="flex items-center justify-between gap-3">
+        <div className="flex items-center gap-2">
+          <span className="grid h-9 w-9 place-items-center rounded-xl bg-accent text-accent-fg"><Icon name="list" className="w-5 h-5" /></span>
+          <span className="font-display text-xl font-bold tracking-tight">Crate Sorter</span>
+        </div>
+        {lib && (
+          <div className="flex items-center gap-2 text-sm">
+            <span className="rounded-full border border-line px-2.5 py-1 text-muted">{demo ? 'Sample library' : lib.me.display_name || lib.me.id}</span>
+            {!busy && <button onClick={signOut} className="rounded-lg p-2 text-muted hover:text-fg" aria-label="Sign out"><Icon name="logout" /></button>}
+          </div>
+        )}
+      </header>
+
+      {err && <Notice tone="danger"><strong className="block">Something went wrong</strong>{err}</Notice>}
+
+      {view === 'welcome' && (
+        <>
+          <section className="flex flex-col gap-3 pt-2">
+            <p className="eyebrow">Spotify library reset</p>
+            <h1 className="text-[2rem] leading-[1.1] font-bold">Ten playlists instead of a hundred.</h1>
+            <p className="text-muted">Crate Sorter reads your Liked Songs, looks up each artist's genres, and files every song into one of ten mood and genre playlists. It only adds new playlists: your existing playlists, their names and their songs are never changed. You see the full plan first, and you can remove the new playlists again with one tap.</p>
+          </section>
+          <BucketGrid buckets={BUCKETS} />
+
+          <Panel className="flex flex-col gap-3">
+            <h2 className="text-lg font-bold">Connect your account</h2>
+            {IN_PREVIEW ? (
+              <Notice tone="accent" icon="eye">
+                This preview window can't reach Spotify, so connecting only works from the hosted copy of this page. You can still try the whole flow here with a sample library. Nothing is sent anywhere.
+              </Notice>
+            ) : null}
+            <label htmlFor="cid" className="text-sm font-medium">Spotify Client ID</label>
+            <input id="cid" value={clientId} onChange={e => setClientId(e.target.value)} placeholder="32 characters from developer.spotify.com"
+              className="w-full rounded-xl border border-line bg-bg px-3 py-3 font-mono text-sm" autoComplete="off" spellCheck="false" />
+            <div className="text-sm">
+              <span className="text-muted">Redirect URI to register:</span>
+              <div className="mt-1 flex items-center gap-2">
+                <code className="min-w-0 flex-1 overflow-x-auto whitespace-nowrap rounded-lg border border-line bg-bg px-2 py-1.5 font-mono text-xs select-all">{REDIRECT}</code>
+                <button onClick={() => copyText(REDIRECT, setCopyMsg)} className="rounded-lg border border-line p-2" aria-label="Copy redirect URI"><Icon name="copy" /></button>
+              </div>
+              {copyMsg && <span className="text-xs text-muted">{copyMsg}</span>}
+            </div>
+            <Toggle id="own" checked={includeOwn} onChange={setIncludeOwn} label="Also sort songs from my own playlists"
+              hint="Liked Songs are always included. This adds one request per playlist." />
+            <Btn onClick={connect} disabled={IN_PREVIEW} className="w-full text-base py-4"><Icon name="music" className="w-5 h-5" />Connect &amp; Automatically Sync Spotify</Btn>
+            <Btn kind="ghost" onClick={() => load(true)} className="w-full"><Icon name="eye" />Try it with a sample library</Btn>
+            <details className="rounded-xl border border-line p-3 text-sm">
+              <summary className="flex items-center justify-between font-medium">First-time setup (5 minutes)<Icon name="chevron" /></summary>
+              <ol className="mt-2 list-decimal pl-5 space-y-1 text-muted">
+                <li>Open developer.spotify.com/dashboard and sign in. Spotify requires the app owner to have Premium.</li>
+                <li>Create app. Name it anything, tick “Web API”.</li>
+                <li>Paste the redirect URI above into “Redirect URIs” exactly, including the trailing path. It must be HTTPS.</li>
+                <li>Copy the Client ID into the box above. No client secret is needed.</li>
+                <li>In User Management, add the email of every Spotify account that will use it (up to 5).</li>
+              </ol>
+            </details>
+          </Panel>
+
+          {hasUndo && (
+            <UndoPanel journal={journal} onUndo={undo}
+              needsLogin={!journal.demo && !store.get('cs.tok')} copy={() => copyText(JSON.stringify(journal, null, 2), setCopyMsg)} copyMsg={copyMsg} />
+          )}
+        </>
+      )}
+
+      {view === 'loading' && (
+        <Panel className="flex flex-col gap-3">
+          <div className="flex items-center gap-2 font-semibold"><Icon name="loader" className="w-5 h-5 spin text-accent" />Reading your library</div>
+          <p className="text-sm text-muted">Large libraries take a few minutes, because Spotify now only gives out genres one artist at a time.</p>
+          <Log lines={lines} />
+        </Panel>
+      )}
+
+      {view === 'dashboard' && plan && (
+        <>
+          {demo && <Notice tone="accent" icon="eye">You're looking at a sample library. Every button works, and nothing touches a real account.</Notice>}
+          <div className="grid grid-cols-3 gap-2">
+            {[[lib.tracks.length, 'songs found'], [plan.final.length, 'new playlists'], [lib.playlists.length, 'left untouched']].map(([n, l]) => (
+              <div key={l} className="rounded-xl border border-line bg-surface p-3">
+                <div className="font-display text-2xl font-bold num">{n.toLocaleString()}</div>
+                <div className="text-xs text-muted">{l}</div>
+              </div>
+            ))}
+          </div>
+          <p className="text-sm text-muted -mt-1 num">
+            {lib.tracks.length ? Math.round(plan.viaGenre / lib.tracks.length * 100) : 0}% sorted by artist genre, the rest by song names and release year.
+          </p>
+
+          <Panel className="flex flex-col gap-3">
+            <div className="flex items-baseline justify-between gap-2"><h2 className="text-lg font-bold">New playlists</h2><span className="text-sm text-muted num">{plan.final.length} will be created</span></div>
+            <ul className="flex flex-col divide-y divide-[var(--line)]">
+              {plan.buckets.map(b => (
+                <li key={b.key} className={'py-2 flex items-start gap-3 ' + (off.has(b.key) ? 'opacity-50' : '')}>
+                  <input id={'on' + b.key} type="checkbox" aria-label={'Create ' + b.name} className="mt-1.5 h-4 w-4 accent-[var(--accent)]" checked={!off.has(b.key)}
+                    onChange={e => setOff(s => { const n = new Set(s); e.target.checked ? n.delete(b.key) : n.add(b.key); return n; })} />
+                  <div className="min-w-0 flex-1">
+                  <button className="flex w-full items-center gap-3 text-left" onClick={() => setOpenBucket(openBucket === b.key ? null : b.key)} aria-expanded={openBucket === b.key}>
+                    <span className="h-3 w-3 rounded-full" style={{ background: dot(b.hue) }} />
+                    <span className="min-w-0 flex-1">
+                      <span className="block font-semibold">{b.name}</span>
+                      <span className="block truncate text-xs text-muted">{off.has(b.key) ? 'Off. Its songs go to their next-best match.' : b.tracks.length ? b.tracks.slice(0, 3).map(t => t.name).join(' · ') : 'No songs matched. This playlist will be skipped.'}</span>
+                      {(() => { const parts = plan.final.filter(f => f.parent === b.key); return parts.length ? <span className="block text-xs text-accent">Splits into {parts.map(f => f.name.split(' · ')[1]).join(', ')}</span> : null; })()}
+                    </span>
+                    <span className="num text-sm font-semibold">{b.tracks.length}</span>
+                    <Icon name="chevron" className={'w-4 h-4 text-muted transition ' + (openBucket === b.key ? 'rotate-180' : '')} />
+                  </button>
+                  {openBucket === b.key && b.tracks.length > 0 && (
+                    <ul className="mt-2 max-h-56 overflow-y-auto rounded-lg bg-bg p-2 text-sm">
+                      {b.tracks.map(t => <li key={t.id} className="flex justify-between gap-2 py-0.5"><span className="min-w-0 truncate">{t.name}</span><span className="shrink-0 text-muted truncate max-w-[45%]">{t.artists.map(a => a.name).join(', ')}</span></li>)}
+                    </ul>
+                  )}
+                  </div>
+                </li>
+              ))}
+            </ul>
+            <Toggle id="split" checked={split} onChange={setSplit} label={`Split playlists over ${splitAt} songs by decade`}
+              hint="For example Rock & Alt · 1990s and Rock & Alt · 2010s. Gives you more, smaller playlists." />
+            <Toggle id="unsorted" checked={unsortedToPop} onChange={setUnsortedToPop} label="Put songs with no match into Pop"
+              hint={unsortedToPop ? 'Every song lands somewhere.' : `${plural(plan.unsorted.length, 'song')} will be left out.`} />
+          </Panel>
+
+          <Panel className="flex flex-col gap-2">
+            <div className="flex items-center gap-2"><Icon name="shield" className="w-5 h-5 text-ok" /><h2 className="text-lg font-bold">Your playlists stay as they are</h2></div>
+            <p className="text-sm text-muted">Crate Sorter only reads these. Names, songs and order are not changed, and Liked Songs isn't changed either.</p>
+            <ul className="flex flex-col gap-1.5">
+              {lib.playlists.map(p => (
+                <li key={p.id} className="flex items-center gap-2 text-sm">
+                  <Icon name="lock" className="w-3.5 h-3.5 text-muted" />
+                  <span className="min-w-0 flex-1 truncate">{p.name}</span>
+                  <span className="shrink-0 text-xs text-muted num">{plural(p.items?.total ?? p.tracks?.total ?? 0, 'song')}</span>
+                </li>
+              ))}
+              {!lib.playlists.length && <li className="text-sm text-muted">No playlists found.</li>}
+            </ul>
+          </Panel>
+
+          {hasUndo && (
+            <UndoPanel journal={journal} onUndo={undo}
+              copy={() => copyText(JSON.stringify(journal, null, 2), setCopyMsg)} copyMsg={copyMsg} />
+          )}
+
+          <div className="fixed inset-x-0 bottom-0 z-10 border-t border-line bg-surface"
+            style={{ paddingBottom: 'calc(env(safe-area-inset-bottom, 0px) + 12px)', paddingTop: 12, paddingLeft: 'max(16px, env(safe-area-inset-left, 0px))', paddingRight: 'max(16px, env(safe-area-inset-right, 0px))' }}>
+            <div className="mx-auto max-w-xl flex flex-col gap-2">
+              {confirming ? (
+                <>
+                  <p className="text-sm">
+                    {dry ? 'Dry run: ' : <strong>This adds playlists to your account. </strong>}
+                    Create {plural(plan.final.length, 'private playlist')} holding {plural(plan.final.reduce((n, b) => n + b.tracks.length, 0), 'song')}. Your existing playlists won't change.
+                  </p>
+                  <div className="grid grid-cols-2 gap-2">
+                    <Btn kind="ghost" onClick={() => setConfirming(false)}><Icon name="x" />Cancel</Btn>
+                    <Btn onClick={execute}><Icon name="check" />{dry ? 'Run preview' : 'Yes, do it'}</Btn>
+                  </div>
+                </>
+              ) : (
+                <>
+                  <Toggle id="dry" checked={dry} onChange={setDry} label="Dry run" hint={dry ? 'Shows every step without changing anything.' : 'Real run. New playlists can be removed with Undo.'} />
+                  <Btn onClick={() => setConfirming(true)} className="w-full text-base py-4"><Icon name="play" className="w-5 h-5" />Start Full Automation</Btn>
+                </>
+              )}
+            </div>
+          </div>
+        </>
+      )}
+
+      {view === 'running' && (
+        <Panel className="flex flex-col gap-3">
+          <div className="flex items-center justify-between gap-2">
+            <h2 className="flex items-center gap-2 text-lg font-bold">
+              {busy ? <Icon name="loader" className="w-5 h-5 spin text-accent" /> : <Icon name="check" className="w-5 h-5 text-ok" />}
+              {runKind === 'undo' ? 'Undoing' : runKind === 'dry' ? 'Dry run' : 'Automation'}{busy ? '…' : ' finished'}
+            </h2>
+            <span className="num font-semibold">{pct}%</span>
+          </div>
+          <Progress pct={pct} />
+          <Log lines={lines} />
+          {!busy && (
+            <div className="flex flex-col gap-2">
+              <Btn kind="ghost" onClick={() => setView(lib ? 'dashboard' : 'welcome')} className="w-full">Back to the plan</Btn>
+              {hasUndo && runKind !== 'undo' && (
+                <UndoPanel journal={journal} onUndo={undo}
+                  copy={() => copyText(JSON.stringify(journal, null, 2), setCopyMsg)} copyMsg={copyMsg} />
+              )}
+            </div>
+          )}
+        </Panel>
+      )}
+    </div>
+  );
+}
+
+function UndoPanel({ journal, onUndo, copy, copyMsg, needsLogin }) {
+  const when = new Date(journal.at).toLocaleString([], { dateStyle: 'medium', timeStyle: 'short' });
+  return (
+    <Panel className="flex flex-col gap-2">
+      <div className="flex items-center gap-2"><Icon name="undo" className="w-5 h-5 text-accent" /><h2 className="text-lg font-bold">Undo last run</h2></div>
+      <p className="text-sm text-muted">{when}{journal.demo ? ' (sample library)' : ''}: {plural(journal.created.length, 'playlist')} created. Undo removes only these.</p>
+      {needsLogin && <p className="text-sm text-warn">Connect again first, so Crate Sorter can remove them.</p>}
+      <div className="grid grid-cols-2 gap-2">
+        <Btn kind="ghost" onClick={copy}><Icon name="copy" />Copy record</Btn>
+        <Btn kind="danger" onClick={onUndo} disabled={needsLogin}><Icon name="undo" />Undo</Btn>
+      </div>
+      {copyMsg && <span className="text-xs text-muted">{copyMsg}</span>}
+    </Panel>
+  );
+}
+
+ReactDOM.createRoot(document.getElementById('root')).render(<App />);
+</script>
+
+</body>
+</html>
