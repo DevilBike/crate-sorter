@@ -13,3 +13,11 @@ Sorts your Spotify Liked Songs into new mood and genre playlists. It never chang
 5. Open the link above on your phone in Chrome, paste the Client ID, tap Connect, then use "Add to Home screen".
 
 Everything runs in your browser. Your sign-in token and settings are kept only in that browser's storage.
+
+## Android app
+
+For long runs, install the Android app. It shows the same page, but keeps working in the background with a normal notification and no audio, so it never interrupts your music.
+
+**Download:** https://github.com/DevilBike/crate-sorter/releases/latest/download/CrateSorter.apk
+
+Open the file on your phone and allow installing from your browser if Android asks. GitHub Actions builds it from `android/` on every change, and new versions install over old ones.

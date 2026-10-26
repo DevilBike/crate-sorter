@@ -100,7 +100,7 @@ const REDIRECT = location.origin + location.pathname;
 const API = 'https://api.spotify.com/v1';
 const MIN_GAP = 600; // ms between Spotify requests. Slow on purpose: fewer bursts, fewer 429s.
 const IN_PREVIEW = (() => { try { return window.self !== window.top; } catch { return true; } })();
-const APP_VERSION = '2026-10-26.7';
+const APP_VERSION = '2026-10-26.8';
 try { localStorage.removeItem('cs.genres'); } catch {}
 
 // Ten buckets. kw = words matched against artist genres, title = words matched against song/album names.
@@ -141,7 +141,13 @@ const dot = h => `hsl(${h} 62% 48%)`;
 const tint = h => `hsl(${h} 60% 50% / 0.14)`;
 
 /* ---------- Small helpers ---------- */
-const sleep = ms => new Promise(r => setTimeout(r, ms));
+// Inside the Android app, waits are timed natively, because a page in the background gets its timers throttled.
+const NATIVE = window.CrateNative || null;
+const sleepers = {}; let sleepSeq = 0;
+window.__crateWake = id => { const r = sleepers[id]; delete sleepers[id]; r?.(); };
+const sleep = ms => NATIVE && ms >= 50
+  ? new Promise(r => { const id = ++sleepSeq; sleepers[id] = r; NATIVE.sleep(id, Math.round(ms)); })
+  : new Promise(r => setTimeout(r, ms));
 const store = {
   get(k, d = null) { try { const v = localStorage.getItem(k); return v == null ? d : JSON.parse(v); } catch { return d; } },
   set(k, v) { try { localStorage.setItem(k, JSON.stringify(v)); } catch {} },
@@ -169,7 +175,7 @@ document.addEventListener('visibilitychange', () => debug.add('PAGE', document.h
 // Background mode: Android browsers freeze pages you leave, but not pages playing audio.
 // So while the app works it plays a looping, inaudible sound (a -84 dB tone) and shows a media notification.
 const keepAlive = (() => {
-  let audio = null, onChange = () => {};
+  let audio = null, onChange = () => {}, nativeOn = false;
   function wavUrl() {
     const rate = 8000, n = rate * 2, buf = new ArrayBuffer(44 + n * 2), v = new DataView(buf);
     const w = (o, str) => [...str].forEach((c, i) => v.setUint8(o + i, c.charCodeAt(0)));
@@ -180,9 +186,11 @@ const keepAlive = (() => {
     return URL.createObjectURL(new Blob([buf], { type: 'audio/wav' }));
   }
   return {
-    get on() { return !!audio && !audio.paused; },
+    get on() { return NATIVE ? nativeOn : !!audio && !audio.paused; },
     listen(fn) { onChange = fn; },
     start() {
+      // The Android app runs a proper background service instead, so music keeps playing undisturbed.
+      if (NATIVE) { if (!nativeOn) { NATIVE.setWorking(true); nativeOn = true; debug.add('PAGE', 'app background service on'); onChange(true); } return Promise.resolve(true); }
       if (!audio) {
         audio = new Audio(wavUrl()); audio.loop = true;
         audio.addEventListener('pause', () => { debug.add('PAGE', 'background mode off'); onChange(false); });
@@ -200,7 +208,9 @@ const keepAlive = (() => {
         return true;
       }).catch(e => { debug.add('PAGE', 'background mode needs a tap: ' + e.message); return false; });
     },
-    stop() { if (audio && !audio.paused) audio.pause(); if ('mediaSession' in navigator) navigator.mediaSession.playbackState = 'none'; },
+    stop() {
+      if (NATIVE) { if (nativeOn) { NATIVE.setWorking(false); nativeOn = false; debug.add('PAGE', 'app background service off'); onChange(false); } return; }
+      if (audio && !audio.paused) audio.pause(); if ('mediaSession' in navigator) navigator.mediaSession.playbackState = 'none'; },
   };
 })();
 
@@ -582,6 +592,7 @@ function Progress({ pct }) {
   );
 }
 async function copyText(text, setMsg) {
+  if (NATIVE) { try { NATIVE.copy(text); setMsg('Copied'); } catch { setMsg('Copy failed. Select the text and copy it.'); } setTimeout(() => setMsg(''), 2500); return; }
   try { await navigator.clipboard.writeText(text); setMsg('Copied'); }
   catch { setMsg('Copy blocked here. Select the text and copy it.'); }
   setTimeout(() => setMsg(''), 2500);
@@ -615,7 +626,7 @@ function App() {
   const [bgWanted, setBgWanted] = useState(() => store.get('cs.background', true));
   useEffect(() => { keepAlive.listen(setBgOn); }, []);
   useEffect(() => { store.set('cs.background', bgWanted); }, [bgWanted]);
-  useEffect(() => { if (!working) keepAlive.stop(); }, [working]);
+  useEffect(() => { if (!working) keepAlive.stop(); else if (NATIVE && !demo) keepAlive.start(); }, [working]);
   const startBackground = () => { setBgWanted(true); keepAlive.start(); };
 
   // Keep the screen on while working: Android browsers pause or reload pages that go to the background.
@@ -718,7 +729,7 @@ function App() {
       'Crate Sorter troubleshooting log',
       `Version ${APP_VERSION} · ${new Date().toISOString()}`,
       `Browser: ${navigator.userAgent}`,
-      `Page: ${REDIRECT}${IN_PREVIEW ? ' (preview frame)' : ''} · Client ID set: ${clientId.trim() ? 'yes' : 'no'} · Signed in: ${store.get('cs.tok') ? 'yes' : 'no'}`,
+      `Page: ${REDIRECT}${IN_PREVIEW ? ' (preview frame)' : ''}${NATIVE ? ` · Android app, battery ${NATIVE.batteryUnrestricted() ? 'unrestricted' : 'optimized'}` : ''} · Client ID set: ${clientId.trim() ? 'yes' : 'no'} · Signed in: ${store.get('cs.tok') ? 'yes' : 'no'}`,
       `View: ${view} · Busy: ${busy} · Demo: ${demo}`,
       `Settings: dryRun=${dry} genres=${lookupGenres} ownPlaylists=${includeOwn} split=${split} unsortedToPop=${unsortedToPop} off=[${[...off].join(',')}]`,
       `Saved library: ${saved ? `${saved.tracks.length} songs, ${saved.playlists.length} playlists, read ${new Date(saved.at).toISOString()}` : 'none'}`,
@@ -810,10 +821,20 @@ function App() {
           <p className="text-sm text-muted">The first genre lookup takes a while for a big library (about 1 artist a second). Progress is saved as it goes, so nothing is lost if it stops.</p>
           <Log lines={lines} />
           {!demo && (bgOn ? (
+            NATIVE ? (
+              <Notice tone="ok" icon="check">
+                <strong className="block">Running in the background</strong>
+                <span className="block">You can lock your phone, switch apps and play music. A “Crate Sorter is working” notification shows until it finishes. Don't swipe the app away from your recent apps.</span>
+                {!NATIVE.batteryUnrestricted() && (
+                  <Btn kind="ghost" className="w-full py-2 mt-2" onClick={() => NATIVE.askBattery()}>Allow unrestricted battery (recommended)</Btn>
+                )}
+              </Notice>
+            ) : (
             <Notice tone="ok" icon="check">
               <strong className="block">Background mode is on</strong>
               You can lock your phone or use other apps. A “Crate Sorter is working” media notification shows until it finishes. Pausing it there turns background mode off.
             </Notice>
+            )
           ) : (
             <Notice tone="warn" icon="alert">
               <strong className="block">This stops if you leave the page</strong>
@@ -936,10 +957,20 @@ function App() {
           <Log lines={lines} />
           {busy && runKind !== 'dry' && (<>
           {!demo && (bgOn ? (
+            NATIVE ? (
+              <Notice tone="ok" icon="check">
+                <strong className="block">Running in the background</strong>
+                <span className="block">You can lock your phone, switch apps and play music. A “Crate Sorter is working” notification shows until it finishes. Don't swipe the app away from your recent apps.</span>
+                {!NATIVE.batteryUnrestricted() && (
+                  <Btn kind="ghost" className="w-full py-2 mt-2" onClick={() => NATIVE.askBattery()}>Allow unrestricted battery (recommended)</Btn>
+                )}
+              </Notice>
+            ) : (
             <Notice tone="ok" icon="check">
               <strong className="block">Background mode is on</strong>
               You can lock your phone or use other apps. A “Crate Sorter is working” media notification shows until it finishes. Pausing it there turns background mode off.
             </Notice>
+            )
           ) : (
             <Notice tone="warn" icon="alert">
               <strong className="block">This stops if you leave the page</strong>
