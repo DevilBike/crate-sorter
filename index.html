@@ -101,7 +101,7 @@ const REDIRECT = location.origin + location.pathname;
 const API = 'https://api.spotify.com/v1';
 const MIN_GAP = 600; // ms between Spotify requests. Slow on purpose: fewer bursts, fewer 429s.
 const IN_PREVIEW = (() => { try { return window.self !== window.top; } catch { return true; } })();
-const APP_VERSION = '2026-10-31.2';
+const APP_VERSION = '2026-10-31.3';
 try { localStorage.removeItem('cs.genres'); } catch {}
 
 // Ten built-in buckets, plus any you add yourself (appended by applyCustom).
@@ -140,7 +140,7 @@ const BASE_BUCKETS = [
 ];
 const BUCKETS = [...BASE_BUCKETS];
 const POP = BUCKETS.findIndex(b => b.key === 'pop');
-// Your own playlists: a name and words to match against tags or artist names. They count double, so they win ties.
+// Your own playlists: a name and words to match against tags or artist names. A match always beats the built-in playlists.
 function applyCustom(list) {
   BUCKETS.length = BASE_BUCKETS.length;
   for (const c of list || []) BUCKETS.push({ key: c.key, name: c.name, hue: c.hue, blurb: c.words.join(', ') || 'Sorted by hand', kw: c.words, title: [], weight: 2, custom: true });
@@ -550,7 +550,8 @@ function classify(track, genres, lfm) {
     why[i] = [...hit];
     return [i, s];
   });
-  const ranked = scored.filter(([, s]) => s > 0).sort((x, y) => y[1] - x[1] || x[0] - y[0]).map(([i]) => i);
+  // Your own playlists come first whenever they match at all; that's how a genre gets split out.
+  const ranked = scored.filter(([, s]) => s > 0).sort((x, y) => (!!BUCKETS[y[0]].custom - !!BUCKETS[x[0]].custom) || y[1] - x[1] || x[0] - y[0]).map(([i]) => i);
   return { ranked, why, tags: [...new Set([...own, ...g])], via: g.length || own.length ? 'genre' : 'name' };
 }
 
@@ -576,7 +577,7 @@ function manualFor(t, manual) {
   const a = t.artists[0] && manual?.artists?.[t.artists[0].id];
   return a ? { key: a, by: 'artist' } : null;
 }
-function buildPlan(lib, { unsortedToPop, off, split, splitAt, skipSrc, manual, lfm }) {
+function buildPlan(lib, { unsortedToPop, off, split, splitAt, skipSrc, manual, lfm, merges = [], mergeNames = {} }) {
   const buckets = BUCKETS.map(b => ({ ...b, tracks: [] }));
   const unsorted = [], skipped = []; let viaGenre = 0, byHand = 0;
   const where = new Map(); // song id → { key, by }
@@ -592,7 +593,17 @@ function buildPlan(lib, { unsortedToPop, off, split, splitAt, skipSrc, manual, l
     else if (unsortedToPop && !off.has('pop')) { buckets[POP].tracks.push(t); where.set(t.id, { key: 'pop', by: 'none', why: [], tags: r.tags }); }
     else { unsorted.push(t); where.set(t.id, { key: null, by: 'none', why: [], tags: r.tags }); }
   }
-  const final = buckets.filter(b => !off.has(b.key) && b.tracks.length)
+  // Combined playlists: every song from one goes into the other, under the name you chose.
+  const into = k => { const seen = new Set(); while (!seen.has(k)) { seen.add(k); const m = merges.find(x => x.from === k); if (!m || off.has(m.into)) break; k = m.into; } return k; };
+  for (const b of buckets) {
+    const target = into(b.key);
+    if (target === b.key || off.has(b.key)) continue;
+    const t = buckets.find(x => x.key === target); if (!t) continue;
+    for (const tr of b.tracks) { t.tracks.push(tr); const w = where.get(tr.id); if (w) where.set(tr.id, { ...w, key: target }); }
+    b.tracks = []; b.mergedInto = target; (t.combined ||= []).push(b.name);
+  }
+  for (const b of buckets) if (b.combined && mergeNames[b.key]) b.name = mergeNames[b.key];
+  const final = buckets.filter(b => !off.has(b.key) && !b.mergedInto && b.tracks.length)
     .flatMap(b => split && b.tracks.length > splitAt ? splitByDecade(b) : [b]);
   return { buckets, final, unsorted, skipped, viaGenre, byHand, where, chosenTracks: chosen, chosen: chosen.length - skipped.length };
 }
@@ -837,6 +848,10 @@ function App() {
   const [custom, setCustom] = useState(() => store.get('cs.custom', []));
   useEffect(() => { store.set('cs.custom', custom); }, [custom]);
   const [editing, setEditing] = useState(null); // a custom playlist being added or edited
+  const [merges, setMerges] = useState(() => store.get('cs.merges', []));
+  const [mergeNames, setMergeNames] = useState(() => store.get('cs.mergeNames', {}));
+  useEffect(() => { store.set('cs.merges', merges); store.set('cs.mergeNames', mergeNames); }, [merges, mergeNames]);
+  const [combining, setCombining] = useState(null);
   useEffect(() => { store.set('cs.lfmKey', lfmKey.trim()); }, [lfmKey]);
   useEffect(() => { store.set('cs.manual', manual); }, [manual]);
   const [askRescan, setAskRescan] = useState(false);
@@ -875,7 +890,8 @@ function App() {
     const until = new Date(Date.now() + s * 1000).toLocaleTimeString([], { hour: '2-digit', minute: '2-digit', second: '2-digit' });
     push(`${why === 'limit' ? 'Spotify asked us to slow down' : why === 'saved' ? 'Still inside the wait Spotify asked for' : 'Connection dropped (often a rate limit)'}. Waiting ${s >= 120 ? Math.round(s / 60) + ' min' : s + 's'}, until ${until}, then carrying on. Keep this page open.`, 'err');
   }), [clientId]);
-  const plan = useMemo(() => { applyCustom(custom); return lib && buildPlan(lib, { unsortedToPop, off, split, splitAt, skipSrc, manual, lfm }); }, [lib, unsortedToPop, off, split, skipSrc, manual, lfm, custom]);
+  const plan = useMemo(() => { applyCustom(custom); return lib && buildPlan(lib, { unsortedToPop, off, split, splitAt, skipSrc, manual, lfm, merges, mergeNames }); }, [lib, unsortedToPop, off, split, skipSrc, manual, lfm, custom, merges, mergeNames]);
+  const makeGenre = tag => setCustom(list => [...list, { key: 'my' + Date.now().toString(36), name: tag.replace(/(^|[\s-])\S/g, c => c.toUpperCase()).replace(/^J Pop$|^K Pop$/i, x => x.replace(' ', '-')), words: [tag], hue: Math.floor(Math.random() * 360) }]);
   useEffect(() => { store.set('cs.off', [...off]); store.set('cs.split', split); }, [off, split]);
 
   useEffect(() => { store.set('cs.clientId', clientId.trim()); }, [clientId]);
@@ -1008,6 +1024,7 @@ function App() {
       `Saved library: ${saved ? `${saved.tracks.length} songs, ${saved.playlists.length} playlists, read ${new Date(saved.at).toISOString()}, format ${saved.v || 1}` : 'none'}`,
       `Sources skipped: ${skipSrc.size ? [...skipSrc].join(',') : 'none'}`,
       `Last.fm: key ${lfmKey ? 'set' : 'not set'}, ${Object.keys(lfm.a).length} artists and ${Object.keys(lfm.t).length} songs tagged${NATIVE ? `, native ${NATIVE.lfmKey ? 'yes' : 'no'}` : ''}`,
+      `Combined: ${merges.map(m => `${m.from}→${m.into}`).join(', ') || 'none'}`,
       `Own playlists: ${custom.map(c => `${c.name} [${c.words.join('|')}]`).join(', ') || 'none'}`,
       `Hand-sorted: ${Object.keys(manual.songs).length} songs, ${Object.keys(manual.artists).length} artists set; ${plan ? `${plan.byHand} songs placed by hand, ${plan.skipped.length} left out` : 'no plan'}`,
       `Liked Songs clearing: ${unlike ? `backup ${unlike.added}/${unlike.backup.length}${unlike.verified ? ' checked' : ''}, removed ${unlike.removed}/${unlike.remove.length}, restored ${unlike.restored || 0}${unlike.demo ? ' (demo)' : ''}` : 'none'}`,
@@ -1169,12 +1186,15 @@ function App() {
                     <span className="h-3 w-3 rounded-full" style={{ background: dot(b.hue) }} />
                     <span className="min-w-0 flex-1">
                       <span className="block font-semibold">{b.name}</span>
-                      <span className="block truncate text-xs text-muted">{off.has(b.key) ? 'Off. Its songs go to their next-best match.' : b.tracks.length ? b.tracks.slice(0, 3).map(t => t.name).join(' · ') : 'No songs matched. This playlist will be skipped.'}</span>
+                      {b.combined && <span className="block text-xs text-accent">Combined with {b.combined.join(', ')}</span>}
+                      <span className="block truncate text-xs text-muted">{off.has(b.key) ? 'Off. Its songs go to their next-best match.' : b.mergedInto ? `Combined into ${plan.buckets.find(x => x.key === b.mergedInto)?.name}` : b.tracks.length ? b.tracks.slice(0, 3).map(t => t.name).join(' · ') : 'No songs matched. This playlist will be skipped.'}</span>
                       {(() => { const parts = plan.final.filter(f => f.parent === b.key); return parts.length ? <span className="block text-xs text-accent">Splits into {parts.map(f => f.name.split(' · ')[1]).join(', ')}</span> : null; })()}
                     </span>
                     <span className="num text-sm font-semibold">{b.tracks.length}</span>
                     {b.custom && <span role="button" tabIndex={0} className="rounded-md border border-line px-2 py-0.5 text-xs text-muted"
                       onClick={e => { e.stopPropagation(); setEditing(custom.find(c => c.key === b.key)); }}>Edit</span>}
+                    {b.mergedInto && <span role="button" tabIndex={0} className="rounded-md border border-line px-2 py-0.5 text-xs text-muted"
+                      onClick={e => { e.stopPropagation(); setMerges(ms => ms.filter(m => m.from !== b.key)); }}>Separate</span>}
                     <Icon name="chevron" className={'w-4 h-4 text-muted transition ' + (openBucket === b.key ? 'rotate-180' : '')} />
                   </button>
                   {openBucket === b.key && b.tracks.length > 0 && (
@@ -1190,16 +1210,28 @@ function App() {
               <CustomEditor item={editing} onCancel={() => setEditing(null)}
                 onSave={c => { setCustom(list => list.some(x => x.key === c.key) ? list.map(x => x.key === c.key ? c : x) : [...list, c]); setEditing(null); }}
                 onDelete={c => { setCustom(list => list.filter(x => x.key !== c.key)); setEditing(null); }} />
+            ) : combining ? (
+              <CombineForm buckets={plan.buckets.filter(b => !off.has(b.key) && !b.mergedInto)} onCancel={() => setCombining(null)}
+                onSave={(a, b, name) => {
+                  setMerges(ms => [...ms.filter(m => m.from !== b), { from: b, into: a }]);
+                  setMergeNames(n => ({ ...n, [a]: name }));
+                  setCombining(null);
+                }} />
             ) : (
-              <Btn kind="ghost" className="w-full py-2" onClick={() => setEditing({ key: 'my' + Date.now().toString(36), name: '', words: [], hue: Math.floor(Math.random() * 360), isNew: true })}>
-                <Icon name="list" />Add your own playlist
-              </Btn>
+              <div className="grid grid-cols-2 gap-2">
+                <Btn kind="ghost" className="py-2 text-sm" onClick={() => setEditing({ key: 'my' + Date.now().toString(36), name: '', words: [], hue: Math.floor(Math.random() * 360), isNew: true })}>
+                  <Icon name="list" />Add your own
+                </Btn>
+                <Btn kind="ghost" className="py-2 text-sm" onClick={() => setCombining(true)}><Icon name="list" />Combine two</Btn>
+              </div>
             )}
             <Toggle id="split" checked={split} onChange={setSplit} label={`Split playlists over ${splitAt} songs by decade`}
               hint="For example Rock & Alt · 1990s and Rock & Alt · 2010s. Gives you more, smaller playlists." />
             <Toggle id="unsorted" checked={unsortedToPop} onChange={setUnsortedToPop} label="Put songs with no match into Pop"
               hint={unsortedToPop ? 'Every song lands somewhere.' : `${plural(plan.unsorted.length, 'song')} will be left out.`} />
           </Panel>
+
+          <GenrePanel plan={plan} lib={lib} lfm={lfm} custom={custom} onMake={makeGenre} />
 
           {!demo && <LastfmPanel lib={lib} lfm={lfm} lfmKey={lfmKey} setLfmKey={setLfmKey} onLookup={lookupLastfm} />}
 
@@ -1238,7 +1270,7 @@ function App() {
       )}
 
       {view === 'sorter' && plan && (
-        <HandSorter plan={plan} off={off} manual={manual} setManual={setManual} lfm={lfm} onDone={() => { setView('dashboard'); window.scrollTo(0, 0); }} />
+        <HandSorter plan={plan} off={new Set([...off, ...plan.buckets.filter(b => b.mergedInto).map(b => b.key)])} manual={manual} setManual={setManual} lfm={lfm} onDone={() => { setView('dashboard'); window.scrollTo(0, 0); }} />
       )}
 
       {view === 'running' && (
@@ -1360,9 +1392,9 @@ function HandSorter({ plan, off, manual, setManual, lfm, onDone }) {
   const [limit, setLimit] = useState(60);
   const [confirmReset, setConfirmReset] = useState(false);
   useEffect(() => setLimit(60), [mode, q, show]);
-  const targets = [...BUCKETS.filter(b => !off.has(b.key)).map(b => ({ key: b.key, name: b.name, hue: b.hue })), { key: 'skip', name: 'Leave out', hue: null }];
-  const nameOf = k => k === 'skip' ? 'Left out' : BUCKETS.find(b => b.key === k)?.name || 'Not sorted';
-  const hueOf = k => BUCKETS.find(b => b.key === k)?.hue;
+  const targets = [...plan.buckets.filter(b => !off.has(b.key)).map(b => ({ key: b.key, name: b.name, hue: b.hue })), { key: 'skip', name: 'Leave out', hue: null }];
+  const nameOf = k => k === 'skip' ? 'Left out' : plan.buckets.find(b => b.key === k)?.name || 'Not sorted';
+  const hueOf = k => plan.buckets.find(b => b.key === k)?.hue;
   const set = (kind, id, key) => setManual(m => {
     const next = { songs: { ...m.songs }, artists: { ...m.artists } };
     if (key == null) delete next[kind][id]; else next[kind][id] = key;
@@ -1541,6 +1573,75 @@ function HandSorter({ plan, off, manual, setManual, lfm, onDone }) {
   );
 }
 
+function CombineForm({ buckets, onSave, onCancel }) {
+  const [a, setA] = useState(buckets[0]?.key || '');
+  const [b, setB] = useState(buckets[1]?.key || '');
+  const nm = k => buckets.find(x => x.key === k)?.name || '';
+  const [name, setName] = useState('');
+  const shown = name || (a && b ? `${nm(a)} & ${nm(b)}` : '');
+  const sel = 'rounded-lg border border-line bg-bg px-3 py-2 text-base';
+  return (
+    <div className="flex flex-col gap-2 rounded-xl border border-accent p-3">
+      <h3 className="font-bold">Combine two playlists</h3>
+      <label htmlFor="ca" className="text-sm">Put all songs from</label>
+      <select id="cb" value={b} onChange={e => setB(e.target.value)} className={sel}>{buckets.map(x => <option key={x.key} value={x.key}>{x.name}</option>)}</select>
+      <label htmlFor="ca" className="text-sm">together with</label>
+      <select id="ca" value={a} onChange={e => setA(e.target.value)} className={sel}>{buckets.map(x => <option key={x.key} value={x.key}>{x.name}</option>)}</select>
+      <label htmlFor="cn" className="text-sm">Name of the combined playlist</label>
+      <input id="cn" value={shown} onChange={e => setName(e.target.value)} className={sel} />
+      <p className="text-xs text-muted">Tap “Separate” on the plan to undo this later.</p>
+      <div className="grid grid-cols-2 gap-2">
+        <Btn kind="ghost" className="py-2" onClick={onCancel}>Cancel</Btn>
+        <Btn className="py-2" disabled={!a || !b || a === b || !shown.trim()} onClick={() => onSave(a, b, shown.trim())}><Icon name="check" />Combine</Btn>
+      </div>
+    </div>
+  );
+}
+
+// The genres that show up most in your library, so a big one can get its own playlist.
+function GenrePanel({ plan, lib, lfm, custom, onMake }) {
+  const [more, setMore] = useState(false);
+  const rows = useMemo(() => {
+    const count = {}, where = {};
+    const taken = new Set(custom.flatMap(c => c.words.map(norm)));
+    for (const t of plan.chosenTracks) {
+      const a = t.artists[0];
+      const tags = new Set([...(lib.genres?.[a?.id] || []), ...(lfm.a[a?.id]?.tags || []), ...(lfm.t[t.id] || [])].map(norm));
+      const k = plan.where.get(t.id)?.key;
+      for (const tag of tags) {
+        if (!tag || VAGUE.has(tag) || MOODS.has(tag) || taken.has(tag) || /^\d+s?$/.test(tag)) continue;
+        count[tag] = (count[tag] || 0) + 1;
+        if (k) ((where[tag] ||= {})[k] = (where[tag][k] || 0) + 1);
+      }
+    }
+    const min = Math.max(3, Math.round(plan.chosenTracks.length * 0.015));
+    return Object.entries(count).filter(([, n]) => n >= min).sort((x, y) => y[1] - x[1]).map(([tag, n]) => {
+      const top = Object.entries(where[tag] || {}).sort((x, y) => y[1] - x[1])[0];
+      return { tag, n, now: top && plan.buckets.find(b => b.key === top[0])?.name, share: top ? Math.round(top[1] / n * 100) : 0 };
+    });
+  }, [plan, lib, lfm, custom]);
+  if (!rows.length) return null;
+  const shown = more ? rows.slice(0, 40) : rows.slice(0, 10);
+  return (
+    <Panel className="flex flex-col gap-2">
+      <div className="flex items-center gap-2"><Icon name="list" className="w-5 h-5 text-accent" /><h2 className="text-lg font-bold">Biggest genres in your library</h2></div>
+      <p className="text-sm text-muted">Give a genre its own playlist and its songs move there. It shows up in “New playlists”, where you can edit it or combine it with another.</p>
+      <ul className="flex flex-col divide-y divide-[var(--line)]">
+        {shown.map(r => (
+          <li key={r.tag} className="flex items-center gap-3 py-2">
+            <span className="min-w-0 flex-1">
+              <span className="block truncate text-sm font-medium">{r.tag}</span>
+              <span className="block truncate text-xs text-muted num">{plural(r.n, 'song')}{r.now ? ` · now ${r.share}% in ${r.now}` : ''}</span>
+            </span>
+            <button className="shrink-0 rounded-lg border border-line px-3 py-1.5 text-sm" onClick={() => onMake(r.tag)}>Make playlist</button>
+          </li>
+        ))}
+      </ul>
+      {rows.length > 10 && <button className="self-start text-sm text-muted underline" onClick={() => setMore(m => !m)}>{more ? 'Show fewer' : `Show more (${Math.min(rows.length, 40) - 10})`}</button>}
+    </Panel>
+  );
+}
+
 function CustomEditor({ item, onSave, onCancel, onDelete }) {
   const [name, setName] = useState(item.name);
   const [words, setWords] = useState(item.words.join(', '));
@@ -1553,7 +1654,7 @@ function CustomEditor({ item, onSave, onCancel, onDelete }) {
       <input id="cname" value={name} onChange={e => setName(e.target.value)} placeholder="For example Deathcore, or J-Pop Chill" className="rounded-lg border border-line bg-bg px-3 py-2 text-base" />
       <label htmlFor="cwords" className="text-sm">Words to match, separated by commas</label>
       <input id="cwords" value={words} onChange={e => setWords(e.target.value)} placeholder="deathcore, slam, Bodysnatcher" autoCapitalize="off" className="rounded-lg border border-line bg-bg px-3 py-2 text-base" />
-      <p className="text-xs text-muted">Genres, moods or artist names. A song goes here when its tags or artist match, and these count double, so they win over the built-in playlists. Leave it empty to fill it only by hand in “Sort by hand”.</p>
+      <p className="text-xs text-muted">Genres, moods or artist names. A song goes here whenever its tags or artist match, ahead of the built-in playlists. Leave it empty to fill it only by hand in “Sort by hand”.</p>
       <div className="grid grid-cols-2 gap-2">
         <Btn kind="ghost" className="py-2" onClick={onCancel}>Cancel</Btn>
         <Btn className="py-2" disabled={!name.trim()} onClick={() => onSave({ key: item.key, name: name.trim(), words: list, hue: item.hue })}><Icon name="check" />Save</Btn>
