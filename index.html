@@ -101,22 +101,22 @@ const REDIRECT = location.origin + location.pathname;
 const API = 'https://api.spotify.com/v1';
 const MIN_GAP = 600; // ms between Spotify requests. Slow on purpose: fewer bursts, fewer 429s.
 const IN_PREVIEW = (() => { try { return window.self !== window.top; } catch { return true; } })();
-const APP_VERSION = '2026-10-26.13';
+const APP_VERSION = '2026-10-31.1';
 try { localStorage.removeItem('cs.genres'); } catch {}
 
 // Ten buckets. kw = words matched against artist genres, title = words matched against song/album names.
 const BUCKETS = [
   { key: 'chill', name: 'Chill', hue: 185, blurb: 'Lo-fi, downtempo, dream pop',
-    kw: ['chill', 'lo-fi', 'lofi', 'chillhop', 'jazz hop', 'downtempo', 'trip hop', 'bedroom pop', 'dream pop', 'chillwave', 'sleep', 'lounge', 'bossa nova'],
+    kw: ['chill', 'lo-fi', 'lofi', 'chillhop', 'jazz hop', 'downtempo', 'trip hop', 'bedroom pop', 'dream pop', 'chillwave', 'sleep', 'lounge', 'bossa nova', 'chillout', 'relaxing', 'mellow', 'calm', 'soothing'],
     title: ['lofi', 'lo-fi', 'chill', 'sleep', 'rain', 'calm', 'slowed'] },
   { key: 'energy', name: 'High Energy', hue: 0, blurb: 'Metal, punk, drum & bass, phonk',
-    kw: ['metal', 'punk', 'hardcore', 'hardstyle', 'drum and bass', 'dnb', 'grime', 'drill', 'phonk', 'big room', 'hyperpop', 'thrash', 'nu metal', 'metalcore'],
+    kw: ['metal', 'punk', 'hardcore', 'hardstyle', 'drum and bass', 'dnb', 'grime', 'drill', 'phonk', 'big room', 'hyperpop', 'thrash', 'nu metal', 'metalcore', 'energetic', 'aggressive', 'workout', 'intense'],
     title: ['workout', 'hype', 'rage', 'sped up'] },
   { key: 'acoustic', name: 'Acoustic', hue: 30, blurb: 'Folk, country, singer-songwriter',
-    kw: ['folk', 'acoustic', 'singer-songwriter', 'country', 'bluegrass', 'americana', 'indie folk', 'folk rock'],
+    kw: ['folk', 'acoustic', 'singer-songwriter', 'country', 'bluegrass', 'americana', 'indie folk', 'folk rock', 'acoustic guitar'],
     title: ['acoustic', 'unplugged', 'stripped'] },
   { key: 'focus', name: 'Focus', hue: 225, blurb: 'Classical, ambient, scores, jazz',
-    kw: ['classical', 'ambient', 'instrumental', 'soundtrack', 'score', 'piano', 'neoclassical', 'jazz', 'post-rock', 'orchestra', 'baroque', 'new age', 'minimalism', 'classical piano'],
+    kw: ['classical', 'ambient', 'instrumental', 'soundtrack', 'score', 'piano', 'neoclassical', 'jazz', 'post-rock', 'orchestra', 'baroque', 'new age', 'minimalism', 'classical piano', 'study', 'video game music'],
     title: ['piano', 'instrumental', 'op.', 'sonata', 'concerto', 'étude', 'prelude', 'nocturne', 'symphony', 'main theme'] },
   { key: 'electronic', name: 'Electronic', hue: 270, blurb: 'House, techno, trance, garage',
     kw: ['house', 'techno', 'electro', 'edm', 'trance', 'dubstep', 'electronic', 'electronica', 'synthwave', 'uk garage', 'idm', 'french house', 'deep house', 'breakbeat'],
@@ -362,6 +362,85 @@ async function musicBrainzGenres(name, tries = 0) {
   return (hit?.tags || []).filter(t => (t.count ?? 1) > 0).sort((x, y) => (y.count ?? 0) - (x.count ?? 0)).slice(0, 8).map(t => t.name.toLowerCase());
 }
 
+// Last.fm: listeners tag songs and artists with genres and moods, and list similar artists.
+// One request per song (track.getTopTags) and one per artist (artist.getInfo: tags plus 5 similar artists).
+// Last.fm asks apps to stay well under 5 requests a second, so requests go out one at a time, 300 ms apart.
+const LFM = 'https://ws.audioscrobbler.com/2.0/?format=json&autocorrect=1';
+let lfmLast = 0, lfmGap = 300;
+const lfmTags = (arr, min = 0) => (Array.isArray(arr) ? arr : arr ? [arr] : []).filter(t => (t.count ?? 100) >= min).slice(0, 8).map(t => String(t.name).toLowerCase().trim()).filter(Boolean);
+// Returns { tags, sim } for an artist, tags for a track, null for a temporary failure; throws on a bad key.
+async function lastfm(key, job, tries = 0) {
+  const wait = lfmLast + lfmGap - Date.now();
+  if (wait > 0) await sleep(wait);
+  lfmLast = Date.now();
+  const q = job.kind === 'a'
+    ? `&method=artist.getinfo&artist=${encodeURIComponent(job.artist)}`
+    : `&method=track.gettoptags&artist=${encodeURIComponent(job.artist)}&track=${encodeURIComponent(job.track)}`;
+  let r, j;
+  try { r = await fetchWithTimeout(LFM + q + '&api_key=' + encodeURIComponent(key), {}, 20000); j = await r.json().catch(() => ({})); }
+  catch (e) { debug.add('LFM', `${job.label} → no response (${e.message})`); if (tries < 2) { await sleep(5000); return lastfm(key, job, tries + 1); } return null; }
+  debug.add('LFM', `${job.label} → ${r.status}${j.error ? ' error ' + j.error : ''} ${Date.now() - lfmLast}ms`);
+  if (j.error === 10 || j.error === 26 || r.status === 403 && j.error !== 29) throw Object.assign(new Error('Last.fm did not accept the API key. Check it and try again.'), { badKey: true });
+  if (j.error === 29 || r.status === 429 || r.status >= 500 || j.error === 16 || j.error === 11) {
+    lfmGap = Math.min(lfmGap * 2, 5000);
+    if (tries < 4) { await sleep(10000 * (tries + 1)); return lastfm(key, job, tries + 1); }
+    return null;
+  }
+  lfmGap = Math.max(300, lfmGap * 0.9);
+  if (job.kind === 'a') return { tags: lfmTags(j.artist?.tags?.tag), sim: (j.artist?.similar?.artist || []).map(a => a.name).filter(Boolean) };
+  return lfmTags(j.toptags?.tag, 10); // track tag counts run 0-100; tiny ones are noise
+}
+// Songs and artists still missing Last.fm tags.
+function lastfmTodo(lib, lfm) {
+  const jobs = [], seen = new Set();
+  for (const t of lib.tracks) {
+    const a = t.artists[0]; if (!a) continue;
+    if (!seen.has(a.id)) { seen.add(a.id); if (!(a.id in lfm.a)) jobs.push({ kind: 'a', id: a.id, artist: a.name, label: a.name }); }
+  }
+  for (const t of lib.tracks) {
+    const a = t.artists[0]; if (!a || t.id in lfm.t) continue;
+    jobs.push({ kind: 't', id: t.id, artist: a.name, track: t.name.replace(/\s+-\s+(\d{4} )?remaster(ed)?.*$/i, ''), label: `${a.name} – ${t.name}` });
+  }
+  return jobs;
+}
+// Runs in the native background worker in app 1.5 and newer, otherwise in the page. Saved after every answer.
+async function runLastfm(lib, key, lfm, log, setPct) {
+  const jobs = lastfmTodo(lib, lfm), total = jobs.length;
+  const save = () => store.set('cs.lfm', lfm);
+  if (!total) { log('Every song and artist already has Last.fm tags.'); return; }
+  log(`Looking up ${total.toLocaleString()} songs and artists on Last.fm, about ${Math.max(1, Math.ceil(total * 0.35 / 60))} min.`);
+  if (NATIVE?.lfmKey) {
+    NATIVE.lfmKey(key);
+    NATIVE.mbStart(JSON.stringify(jobs.map(j => [j.kind === 'a' ? 'lfa:' + j.id : 'lft:' + j.id, j.kind === 'a' ? j.artist : j.artist + '\t' + j.track])));
+    for (;;) {
+      let st;
+      try { st = JSON.parse(NATIVE.mbPoll()); } catch (e) { debug.add('ERR', 'Last.fm poll failed: ' + e.message); break; }
+      for (const l of st.log || []) debug.add('LFN', l);
+      if ((st.log || []).some(l => l.includes('bad Last.fm key'))) throw Object.assign(new Error('Last.fm did not accept the API key. Check it and try again.'), { badKey: true });
+      for (const [k, v] of Object.entries(st.results || {})) {
+        if (k.startsWith('lfa:')) lfm.a[k.slice(4)] = { tags: v.filter(x => !x.startsWith('~')), sim: v.filter(x => x.startsWith('~')).map(x => x.slice(1)) };
+        else if (k.startsWith('lft:')) lfm.t[k.slice(4)] = v;
+      }
+      save();
+      const left = lastfmTodo(lib, lfm).length;
+      setPct(Math.round((total - left) / total * 100));
+      log(`Last.fm ${total - left}/${total}`, true);
+      if (!left || (!st.running && !st.left)) break;
+      if (!st.running && st.left) NATIVE.mbStart('[]');
+      await sleep(3000);
+    }
+    return;
+  }
+  let failures = 0;
+  for (const [i, job] of jobs.entries()) {
+    const r = await lastfm(key, job);
+    if (r === null) { if (++failures >= 5) { log('Last.fm is not answering. Progress is saved; try again later.'); break; } }
+    else { failures = 0; if (job.kind === 'a') lfm.a[job.id] = r; else lfm.t[job.id] = r; save(); }
+    setPct(Math.round((i + 1) / total * 100));
+    if (i % 5 === 4 || i === total - 1) log(`Last.fm ${i + 1}/${total}`, true);
+  }
+}
+
 // The library is saved after the first read, so opening the app again costs no requests until you tap Refresh.
 async function loadLibrary(api, { includeOwn, lookupGenres, refresh }, log) {
   let lib = refresh ? null : store.get('cs.lib');
@@ -413,7 +492,7 @@ async function loadLibrary(api, { includeOwn, lookupGenres, refresh }, log) {
       for (;;) {
         let st;
         try { st = JSON.parse(NATIVE.mbPoll()); } catch (e) { debug.add('ERR', 'genre poll failed: ' + e.message); break; }
-        Object.assign(cache, st.results);
+        for (const [k, v] of Object.entries(st.results || {})) if (!k.startsWith('lf')) cache[k] = v;
         store.set('cs.mbgenres', cache);
         for (const l of st.log || []) debug.add('MBN', l);
         log(`Artist genres ${[...artists.keys()].filter(id => id in cache).length}/${artists.size}`, true);
@@ -438,17 +517,20 @@ async function loadLibrary(api, { includeOwn, lookupGenres, refresh }, log) {
 }
 
 /* ---------- Classification ---------- */
-function classify(track, genres) {
-  const g = track.artists.flatMap(a => genres[a.id] || []).map(s => s.toLowerCase());
+function classify(track, genres, lfm) {
+  // Artist genres from MusicBrainz and Last.fm, plus the song's own Last.fm tags, which count for more.
+  const g = [...new Set(track.artists.flatMap(a => [...(genres[a.id] || []), ...(lfm?.a?.[a.id]?.tags || [])]).map(s => s.toLowerCase()))];
+  const own = lfm?.t?.[track.id] || [];
   const text = (track.name + ' ' + track.album).toLowerCase();
   const ranked = BUCKETS.map((b, i) => {
     let s = 0;
     for (const gen of g) for (const k of b.kw) if (gen === k || matchWord(gen, k)) s += b.weight || 1;
+    for (const gen of own) for (const k of b.kw) if (gen === k || matchWord(gen, k)) s += 1.5 * (b.weight || 1);
     for (const k of b.title) if (text.includes(k)) s += 0.75;
     if (b.key === 'throwback' && track.year && track.year < 1990) s += 1.5;
     return [i, s];
   }).filter(([, s]) => s > 0).sort((x, y) => y[1] - x[1] || x[0] - y[0]).map(([i]) => i);
-  return { ranked, via: g.length ? 'genre' : 'name' };
+  return { ranked, via: g.length || own.length ? 'genre' : 'name' };
 }
 
 // Splits one big playlist into decade playlists; decades with few songs share a "Mixed years" playlist.
@@ -473,7 +555,7 @@ function manualFor(t, manual) {
   const a = t.artists[0] && manual?.artists?.[t.artists[0].id];
   return a ? { key: a, by: 'artist' } : null;
 }
-function buildPlan(lib, { unsortedToPop, off, split, splitAt, skipSrc, manual }) {
+function buildPlan(lib, { unsortedToPop, off, split, splitAt, skipSrc, manual, lfm }) {
   const buckets = BUCKETS.map(b => ({ ...b, tracks: [] }));
   const unsorted = [], skipped = []; let viaGenre = 0, byHand = 0;
   const where = new Map(); // song id → { key, by }
@@ -482,7 +564,7 @@ function buildPlan(lib, { unsortedToPop, off, split, splitAt, skipSrc, manual })
     const m = manualFor(t, manual);
     if (m && m.key === 'skip') { skipped.push(t); byHand++; where.set(t.id, m); continue; }
     if (m && !off.has(m.key)) { const i = BUCKETS.findIndex(b => b.key === m.key); if (i >= 0) { buckets[i].tracks.push(t); byHand++; where.set(t.id, m); continue; } }
-    const r = classify(t, lib.genres);
+    const r = classify(t, lib.genres, lfm);
     // A song whose best match is switched off goes to its next-best match that is still on.
     const idx = r.ranked.find(i => !off.has(BUCKETS[i].key));
     if (idx !== undefined) { buckets[idx].tracks.push(t); if (r.via === 'genre') viaGenre++; where.set(t.id, { key: BUCKETS[idx].key, by: 'auto' }); }
@@ -729,6 +811,9 @@ function App() {
   }, [lib]);
   const [unlike, setUnlike] = useState(() => store.get('cs.unlike'));
   const [manual, setManual] = useState(() => store.get('cs.manual', { songs: {}, artists: {} }));
+  const [lfm, setLfm] = useState(() => store.get('cs.lfm', { a: {}, t: {} }));
+  const [lfmKey, setLfmKey] = useState(() => store.get('cs.lfmKey', ''));
+  useEffect(() => { store.set('cs.lfmKey', lfmKey.trim()); }, [lfmKey]);
   useEffect(() => { store.set('cs.manual', manual); }, [manual]);
   const [askRescan, setAskRescan] = useState(false);
   const splitAt = 150;
@@ -766,7 +851,7 @@ function App() {
     const until = new Date(Date.now() + s * 1000).toLocaleTimeString([], { hour: '2-digit', minute: '2-digit', second: '2-digit' });
     push(`${why === 'limit' ? 'Spotify asked us to slow down' : why === 'saved' ? 'Still inside the wait Spotify asked for' : 'Connection dropped (often a rate limit)'}. Waiting ${s >= 120 ? Math.round(s / 60) + ' min' : s + 's'}, until ${until}, then carrying on. Keep this page open.`, 'err');
   }), [clientId]);
-  const plan = useMemo(() => lib && buildPlan(lib, { unsortedToPop, off, split, splitAt, skipSrc, manual }), [lib, unsortedToPop, off, split, skipSrc, manual]);
+  const plan = useMemo(() => lib && buildPlan(lib, { unsortedToPop, off, split, splitAt, skipSrc, manual, lfm }), [lib, unsortedToPop, off, split, skipSrc, manual, lfm]);
   useEffect(() => { store.set('cs.off', [...off]); store.set('cs.split', split); }, [off, split]);
 
   useEffect(() => { store.set('cs.clientId', clientId.trim()); }, [clientId]);
@@ -873,6 +958,17 @@ function App() {
     setBusy(false);
   }
 
+  async function lookupLastfm() {
+    if (bgWanted && !demo) keepAlive.start();
+    setLines([]); setPct(0); setBusy(true); setRunKind('lastfm'); setView('running');
+    const cache = structuredClone(lfm);
+    try {
+      await runLastfm(lib, lfmKey.trim(), cache, (m, live) => push(m, undefined, live), setPct);
+      push('Done. The plan now uses the Last.fm tags, and the hand sorter can suggest playlists.', 'ok');
+    } catch (e) { push(e.message, 'err'); if (!e.badKey) push('Stopped. Progress is saved: tap “Look up tags” again to carry on.', 'err'); }
+    setLfm(store.get('cs.lfm', cache)); setBusy(false);
+  }
+
   function report() {
     const g = store.get('cs.mbgenres', {}), saved = store.get('cs.lib'), lines = debug.lines();
     const statuses = {};
@@ -887,6 +983,7 @@ function App() {
       `Settings: dryRun=${dry} genres=${lookupGenres} ownPlaylists=${includeOwn} split=${split} unsortedToPop=${unsortedToPop} off=[${[...off].join(',')}]`,
       `Saved library: ${saved ? `${saved.tracks.length} songs, ${saved.playlists.length} playlists, read ${new Date(saved.at).toISOString()}, format ${saved.v || 1}` : 'none'}`,
       `Sources skipped: ${skipSrc.size ? [...skipSrc].join(',') : 'none'}`,
+      `Last.fm: key ${lfmKey ? 'set' : 'not set'}, ${Object.keys(lfm.a).length} artists and ${Object.keys(lfm.t).length} songs tagged${NATIVE ? `, native ${NATIVE.lfmKey ? 'yes' : 'no'}` : ''}`,
       `Hand-sorted: ${Object.keys(manual.songs).length} songs, ${Object.keys(manual.artists).length} artists set; ${plan ? `${plan.byHand} songs placed by hand, ${plan.skipped.length} left out` : 'no plan'}`,
       `Liked Songs clearing: ${unlike ? `backup ${unlike.added}/${unlike.backup.length}${unlike.verified ? ' checked' : ''}, removed ${unlike.removed}/${unlike.remove.length}, restored ${unlike.restored || 0}${unlike.demo ? ' (demo)' : ''}` : 'none'}`,
       `MusicBrainz genres saved: ${Object.keys(g).length} (${Object.values(g).filter(v => !v.length).length} with no genres)`,
@@ -1068,6 +1165,8 @@ function App() {
               hint={unsortedToPop ? 'Every song lands somewhere.' : `${plural(plan.unsorted.length, 'song')} will be left out.`} />
           </Panel>
 
+          {!demo && <LastfmPanel lib={lib} lfm={lfm} lfmKey={lfmKey} setLfmKey={setLfmKey} onLookup={lookupLastfm} />}
+
           <SourcePicker lib={lib} skipSrc={skipSrc} setSkipSrc={setSkipSrc} />
 
           {(unlike || clearable) && <ClearLikedPanel unlike={unlike} clearable={clearable} onClear={clearLiked} onRestore={restoreLiked} />}
@@ -1103,7 +1202,7 @@ function App() {
       )}
 
       {view === 'sorter' && plan && (
-        <HandSorter plan={plan} off={off} manual={manual} setManual={setManual} onDone={() => { setView('dashboard'); window.scrollTo(0, 0); }} />
+        <HandSorter plan={plan} off={off} manual={manual} setManual={setManual} lfm={lfm} onDone={() => { setView('dashboard'); window.scrollTo(0, 0); }} />
       )}
 
       {view === 'running' && (
@@ -1111,7 +1210,7 @@ function App() {
           <div className="flex items-center justify-between gap-2">
             <h2 className="flex items-center gap-2 text-lg font-bold">
               {busy ? <Icon name="loader" className="w-5 h-5 spin text-accent" /> : <Icon name="check" className="w-5 h-5 text-ok" />}
-              {{ undo: 'Undoing', dry: 'Dry run', clear: 'Clearing Liked Songs', restore: 'Restoring Liked Songs' }[runKind] || 'Automation'}{busy ? '…' : ' finished'}
+              {{ undo: 'Undoing', dry: 'Dry run', lastfm: 'Last.fm tags', clear: 'Clearing Liked Songs', restore: 'Restoring Liked Songs' }[runKind] || 'Automation'}{busy ? '…' : ' finished'}
             </h2>
             <span className="num font-semibold">{pct}%</span>
           </div>
@@ -1159,9 +1258,52 @@ function App() {
   );
 }
 
+// Learns from your hand sorting: for each artist you haven't sorted, it looks at
+// (1) Last.fm's similar artists you have sorted, in either direction, and
+// (2) how well the artist's tags match the tags of the artists you put in each playlist.
+function suggestArtists(plan, manual, lfm, off) {
+  const handKey = new Map(); // artist id → playlist you chose, by artist or by most of its songs
+  const songVotes = {};
+  for (const t of plan.chosenTracks) {
+    const a = t.artists[0]; const k = manual.songs[t.id];
+    if (a && k && k !== 'skip') ((songVotes[a.id] ||= {})[k] = (songVotes[a.id][k] || 0) + 1);
+  }
+  for (const [id, v] of Object.entries(songVotes)) handKey.set(id, Object.entries(v).sort((x, y) => y[1] - x[1])[0][0]);
+  for (const [id, k] of Object.entries(manual.artists)) if (k !== 'skip') handKey.set(id, k);
+  if (!handKey.size) return { ready: false, list: [] };
+
+  const names = new Map(), byName = new Map();
+  for (const t of plan.chosenTracks) { const a = t.artists[0]; if (a) { names.set(a.id, a.name); byName.set(a.name.toLowerCase(), a.id); } }
+  const profile = {}; // playlist → tag weights
+  for (const [id, k] of handKey) for (const tag of lfm.a[id]?.tags || []) ((profile[k] ||= {})[tag] = (profile[k][tag] || 0) + 1);
+  const simOf = id => (lfm.a[id]?.sim || []).map(n => byName.get(n.toLowerCase())).filter(Boolean);
+  const reverse = new Map();
+  for (const [id] of handKey) for (const other of simOf(id)) (reverse.get(other) || reverse.set(other, []).get(other)).push(id);
+
+  const list = [];
+  for (const [id, name] of names) {
+    if (manual.artists[id] || handKey.has(id)) continue;
+    const score = {}, why = {};
+    for (const other of [...simOf(id), ...(reverse.get(id) || [])]) {
+      const k = handKey.get(other); if (!k || off.has(k)) continue;
+      score[k] = (score[k] || 0) + 2; (why[k] ||= new Set()).add(names.get(other));
+    }
+    const tags = lfm.a[id]?.tags || [];
+    if (tags.length) for (const [k, prof] of Object.entries(profile)) {
+      if (off.has(k)) continue;
+      const total = Object.values(prof).reduce((n, x) => n + x, 0);
+      const hit = tags.reduce((n, tag) => n + (prof[tag] || 0), 0) / total;
+      if (hit > 0) score[k] = (score[k] || 0) + Math.min(1.5, hit * 4);
+    }
+    const best = Object.entries(score).sort((x, y) => y[1] - x[1])[0];
+    if (best && best[1] >= 1) list.push({ id, name, key: best[0], score: best[1], like: [...(why[best[0]] || [])].slice(0, 2) });
+  }
+  return { ready: true, list: list.sort((x, y) => y.score - x.score) };
+}
+
 // Sort songs or whole artists by hand. Pick a playlist at the top, then tap songs to drop them in;
 // or tap a song with nothing picked to choose for just that one.
-function HandSorter({ plan, off, manual, setManual, onDone }) {
+function HandSorter({ plan, off, manual, setManual, lfm, onDone }) {
   const [mode, setMode] = useState('songs');
   const [q, setQ] = useState('');
   const [show, setShow] = useState('all');
@@ -1192,12 +1334,16 @@ function HandSorter({ plan, off, manual, setManual, onDone }) {
     return [...m.values()].map(e => ({ ...e, top: Object.entries(e.keys).sort((x, y) => y[1] - x[1])[0]?.[0] || null })).sort((x, y) => y.n - x.n || x.name.localeCompare(y.name));
   }, [songs]);
 
-  const list = mode === 'songs'
+  const list = mode === 'suggest' ? [] : mode === 'songs'
     ? songs.filter(({ t, w }) => (!needle || (t.name + ' ' + t.artists.map(a => a.name).join(' ') + ' ' + t.album).toLowerCase().includes(needle))
         && (show === 'all' || (show === 'hand' ? w.by === 'song' || w.by === 'artist' : show === 'auto' ? w.by === 'auto' || w.by === 'none' : w.by === 'none')))
     : artists.filter(a => (!needle || a.name.toLowerCase().includes(needle))
         && (show === 'all' || (show === 'hand' ? !!manual.artists[a.id] : show === 'auto' ? !manual.artists[a.id] : !a.top)));
   const handCount = Object.keys(manual.songs).length + Object.keys(manual.artists).length;
+  const sugg = useMemo(() => suggestArtists(plan, manual, lfm, off), [plan, manual, lfm, off]);
+  const sList = sugg.list.filter(x => !needle || x.name.toLowerCase().includes(needle));
+  const songsOf = useMemo(() => { const c = {}; for (const t of plan.chosenTracks) { const a = t.artists[0]; if (a) c[a.id] = (c[a.id] || 0) + 1; } return c; }, [plan]);
+  const accept = items => setManual(m => ({ songs: m.songs, artists: { ...m.artists, ...Object.fromEntries(items.map(x => [x.id, x.key])) } }));
 
   const Chips = ({ current, onPick }) => (
     <div className="flex flex-wrap gap-1.5 pt-2">
@@ -1234,13 +1380,14 @@ function HandSorter({ plan, off, manual, setManual, onDone }) {
           <h2 className="text-lg font-bold">Sort by hand</h2>
           <Btn onClick={onDone} className="py-2 px-4"><Icon name="check" />Done</Btn>
         </div>
-        <div className="grid grid-cols-2 gap-1 rounded-xl border border-line p-1 text-sm">
-          {[['songs', 'Songs'], ['artists', 'Artists']].map(([k, l]) => (
+        <div className="grid grid-cols-3 gap-1 rounded-xl border border-line p-1 text-sm">
+          {[['songs', 'Songs'], ['artists', 'Artists'], ['suggest', `Suggested${sugg.list.length ? ' ' + sugg.list.length : ''}`]].map(([k, l]) => (
             <button key={k} onClick={() => { setMode(k); setOpen(null); }} className={'rounded-lg py-1.5 ' + (mode === k ? 'bg-accent text-accent-fg font-semibold' : '')}>{l}</button>
           ))}
         </div>
         <input type="search" value={q} onChange={e => setQ(e.target.value)} placeholder={mode === 'songs' ? 'Search songs, artists, albums' : 'Search artists'}
           className="rounded-lg border border-line bg-surface px-3 py-2 text-base" aria-label="Search" />
+        {mode !== 'suggest' && <>
         <div className="flex gap-1.5 overflow-x-auto text-xs">
           {[['all', 'All'], ['auto', 'Automatic'], ['hand', 'Set by you'], ['none', 'No match']].map(([k, l]) => (
             <button key={k} onClick={() => setShow(k)} className={'shrink-0 rounded-full border px-3 py-1 ' + (show === k ? 'border-accent text-accent font-semibold' : 'border-line text-muted')}>{l}</button>
@@ -1257,8 +1404,39 @@ function HandSorter({ plan, off, manual, setManual, onDone }) {
             ))}
           </div>
         </div>
+        </>}
       </div>
 
+      {mode === 'suggest' ? (
+        <div className="flex flex-col gap-2">
+          {!sugg.ready ? (
+            <p className="text-sm text-muted">Sort a few artists or songs by hand first. Suggestions come from artists similar to the ones you sorted, and from matching Last.fm tags.</p>
+          ) : !sList.length ? (
+            <p className="text-sm text-muted">No suggestions right now. {Object.keys(lfm.a).length ? 'Sort more artists by hand to get more.' : 'Look up Last.fm tags on the plan screen to get suggestions.'}</p>
+          ) : (<>
+            <div className="flex items-center justify-between gap-2">
+              <p className="text-xs text-muted num">{plural(sList.length, 'artist')} with a suggestion. Accepting sets the artist, and your song-by-song choices still win.</p>
+              <Btn kind="ghost" className="shrink-0 py-1.5 px-3 text-sm" onClick={() => accept(sList)}><Icon name="check" />Accept all</Btn>
+            </div>
+            <ul className="flex flex-col divide-y divide-[var(--line)] rounded-xl border border-line bg-surface">
+              {sList.slice(0, limit).map(x => (
+                <li key={x.id} className="flex items-center gap-3 px-3 py-2">
+                  <span className="min-w-0 flex-1">
+                    <span className="block truncate text-sm font-medium">{x.name}</span>
+                    <span className="flex items-center gap-1 text-xs text-muted">
+                      <span className="h-2.5 w-2.5 shrink-0 rounded-full" style={{ background: dot(hueOf(x.key)) }} />
+                      <span className="truncate">{nameOf(x.key)}{x.like.length ? `, like ${x.like.join(' and ')}` : ', by tags'} · {plural(songsOf[x.id] || 0, 'song')}</span>
+                    </span>
+                  </span>
+                  <button className="shrink-0 rounded-lg border border-line px-2.5 py-1.5 text-sm" onClick={() => { setMode('artists'); setQ(x.name); setOpen(x.id); }}>Other</button>
+                  <button className="shrink-0 rounded-lg bg-accent px-3 py-1.5 text-sm font-semibold text-accent-fg" onClick={() => accept([x])}>Accept</button>
+                </li>
+              ))}
+            </ul>
+            {sList.length > limit && <Btn kind="ghost" onClick={() => setLimit(l => l + 100)}>Show more ({(sList.length - limit).toLocaleString()} left)</Btn>}
+          </>)}
+        </div>
+      ) : (<>
       <p className="text-xs text-muted num">
         {plural(list.length, mode === 'songs' ? 'song' : 'artist')} shown. Your choice for a song beats your choice for its artist, and both beat the automatic sort.
       </p>
@@ -1293,6 +1471,7 @@ function HandSorter({ plan, off, manual, setManual, onDone }) {
         {!list.length && <li className="px-3 py-6 text-center text-sm text-muted">Nothing matches.</li>}
       </ul>
       {list.length > limit && <Btn kind="ghost" onClick={() => setLimit(l => l + 100)}>Show more ({(list.length - limit).toLocaleString()} left)</Btn>}
+      </>)}
 
       {handCount > 0 && (confirmReset ? (
         <Notice tone="warn" icon="alert">
@@ -1307,6 +1486,41 @@ function HandSorter({ plan, off, manual, setManual, onDone }) {
         <button className="text-sm text-muted underline self-center" onClick={() => setConfirmReset(true)}>Clear all my choices ({handCount})</button>
       ))}
     </div>
+  );
+}
+
+function LastfmPanel({ lib, lfm, lfmKey, setLfmKey, onLookup }) {
+  const [draft, setDraft] = useState('');
+  const [editing, setEditing] = useState(!lfmKey);
+  const left = useMemo(() => lastfmTodo(lib, lfm).length, [lib, lfm]);
+  const artists = new Set(lib.tracks.map(t => t.artists[0]?.id).filter(Boolean)).size;
+  const doneA = [...new Set(lib.tracks.map(t => t.artists[0]?.id))].filter(id => id && id in lfm.a).length;
+  const doneT = lib.tracks.filter(t => t.id in lfm.t).length;
+  return (
+    <Panel className="flex flex-col gap-2">
+      <div className="flex items-center gap-2"><Icon name="list" className="w-5 h-5 text-accent" /><h2 className="text-lg font-bold">Better sorting with Last.fm</h2></div>
+      <p className="text-sm text-muted">Adds the genre and mood tags Last.fm listeners give each song and artist, plus similar artists for suggestions in “Sort by hand”.</p>
+      {editing ? (<>
+        <ol className="list-decimal pl-5 text-sm text-muted">
+          <li>Open <a className="text-accent underline" href="https://www.last.fm/api/account/create" target="_blank" rel="noreferrer">last.fm/api/account/create</a> and sign in (a free Last.fm account works).</li>
+          <li>Fill in any app name, like “Crate Sorter”, and your email. Leave the callback empty.</li>
+          <li>Copy the “API key” (not the shared secret) and paste it here.</li>
+        </ol>
+        <input value={draft} onChange={e => setDraft(e.target.value)} placeholder="Last.fm API key" autoCapitalize="off" autoComplete="off" spellCheck="false"
+          className="rounded-lg border border-line bg-bg px-3 py-2 font-mono text-sm" aria-label="Last.fm API key" />
+        <div className="grid grid-cols-2 gap-2">
+          {lfmKey ? <Btn kind="ghost" className="py-2" onClick={() => setEditing(false)}>Cancel</Btn> : <span />}
+          <Btn className="py-2" disabled={!/^[0-9a-f]{32}$/i.test(draft.trim())} onClick={() => { setLfmKey(draft.trim()); setEditing(false); }}>Save key</Btn>
+        </div>
+        {draft.trim() && !/^[0-9a-f]{32}$/i.test(draft.trim()) && <p className="text-xs text-warn">A Last.fm API key is 32 letters and numbers.</p>}
+      </>) : (<>
+        <p className="text-sm num">Tagged: {doneT.toLocaleString()} of {plural(lib.tracks.length, 'song')}, {doneA.toLocaleString()} of {plural(artists, 'artist')}.</p>
+        {left > 0
+          ? <Btn onClick={onLookup}><Icon name="play" />{doneA + doneT ? 'Look up the rest' : 'Look up tags'} ({left.toLocaleString()}, about {Math.max(1, Math.ceil(left * 0.35 / 60))} min)</Btn>
+          : <p className="text-sm text-ok">All done. New songs get tagged after you Refresh and look up again.</p>}
+        <button className="self-start text-xs text-muted underline" onClick={() => { setDraft(''); setEditing(true); }}>Change key</button>
+      </>)}
+    </Panel>
   );
 }
 

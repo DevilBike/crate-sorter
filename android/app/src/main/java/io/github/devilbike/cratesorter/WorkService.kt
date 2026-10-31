@@ -28,6 +28,7 @@ class WorkService : Service() {
     override fun onCreate() {
         super.onCreate()
         instance = this
+        if (LastFm.key.isBlank()) LastFm.key = getSharedPreferences("genres", MODE_PRIVATE).getString("lfmKey", "") ?: ""
     }
 
     override fun onStartCommand(intent: Intent?, flags: Int, startId: Int): Int {
@@ -60,12 +61,17 @@ class WorkService : Service() {
             var failures = 0
             while (true) {
                 val next = GenreStore.peek(this) ?: break
-                Thread.sleep(gap)
-                when (val r = MusicBrainz.lookup(next.second)) {
+                val lastFm = next.first.startsWith("lf")
+                Thread.sleep(if (lastFm) maxOf(300L, gap / 4) else gap)
+                when (val r = if (lastFm) LastFm.lookup(next.first, next.second) else MusicBrainz.lookup(next.second)) {
                     is MusicBrainz.Result.Found -> {
                         GenreStore.put(this, next.first, r.tags)
                         failures = 0
                         gap = maxOf(1200L, gap * 95 / 100)
+                    }
+                    MusicBrainz.Result.BadKey -> {
+                        GenreStore.log("bad Last.fm key, dropping the Last.fm lookups")
+                        GenreStore.dropWhere(this) { it.startsWith("lf") }
                     }
                     MusicBrainz.Result.SlowDown -> {
                         gap = minOf(gap * 3 / 2, 5000L)
@@ -91,7 +97,7 @@ class WorkService : Service() {
 
     private fun statusText(): String {
         val left = GenreStore.left(this)
-        return if (left > 0) "Looking up genres: $left artists left. Tap to see progress."
+        return if (left > 0) "Looking up tags: $left left. Tap to see progress."
         else "Sorting your Spotify library. Tap to see progress."
     }
 

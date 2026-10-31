@@ -10,6 +10,7 @@ object MusicBrainz {
     sealed class Result {
         data class Found(val tags: List<String>) : Result()
         object SlowDown : Result()
+        object BadKey : Result()
         data class Failed(val why: String) : Result()
     }
 

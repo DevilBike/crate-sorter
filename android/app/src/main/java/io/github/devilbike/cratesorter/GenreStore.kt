@@ -14,7 +14,8 @@ object GenreStore {
     private fun queue(c: Context) = JSONArray(prefs(c).getString("queue", "[]"))
     private fun results(c: Context) = JSONObject(prefs(c).getString("results", "{}") ?: "{}")
 
-    // items: JSON array of [spotifyArtistId, artistName]
+    // items: JSON array of [id, query]: a Spotify artist id and name for MusicBrainz,
+    // or "lfa:<artist id>" / "lft:<track id>" with the artist name (and "\t" track name) for Last.fm.
     @Synchronized
     fun enqueue(c: Context, items: String): Int {
         val q = queue(c)
@@ -49,6 +50,14 @@ object GenreStore {
     fun skip(c: Context, id: String) {
         log("skipped $id after repeated failures")
         prefs(c).edit().putString("queue", drop(queue(c), id).toString()).apply()
+    }
+
+    @Synchronized
+    fun dropWhere(c: Context, test: (String) -> Boolean) {
+        val q = queue(c)
+        val out = JSONArray()
+        for (i in 0 until q.length()) if (!test(q.getJSONArray(i).getString(0))) out.put(q.getJSONArray(i))
+        prefs(c).edit().putString("queue", out.toString()).apply()
     }
 
     @Synchronized

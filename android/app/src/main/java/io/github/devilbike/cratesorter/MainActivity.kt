@@ -124,6 +124,12 @@ class MainActivity : Activity() {
         }
 
         @JavascriptInterface
+        fun lfmKey(key: String) {
+            LastFm.key = key
+            getSharedPreferences("genres", MODE_PRIVATE).edit().putString("lfmKey", key).apply()
+        }
+
+        @JavascriptInterface
         fun mbPoll(): String = GenreStore.poll(this@MainActivity)
 
         @JavascriptInterface
