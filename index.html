@@ -101,7 +101,7 @@ const REDIRECT = location.origin + location.pathname;
 const API = 'https://api.spotify.com/v1';
 const MIN_GAP = 600; // ms between Spotify requests. Slow on purpose: fewer bursts, fewer 429s.
 const IN_PREVIEW = (() => { try { return window.self !== window.top; } catch { return true; } })();
-const APP_VERSION = '2026-10-31.3';
+const APP_VERSION = '2026-10-31.4';
 try { localStorage.removeItem('cs.genres'); } catch {}
 
 // Ten built-in buckets, plus any you add yourself (appended by applyCustom).
@@ -569,6 +569,10 @@ function splitByDecade(b, minPart = 20) {
   return parts;
 }
 
+const songKey = t => norm(t.artists[0]?.name || '') + '|' + norm(t.name
+  .replace(/\s*[(\[]\s*(feat|ft|with)\b[^)\]]*[)\]]/gi, '')
+  .replace(/\s+-\s+.*\b(remaster(ed)?|version|edit|mono|stereo|single|radio)\b.*$/i, '')
+  .replace(/\s*[(\[][^)\]]*\b(remaster(ed)?|single version|radio edit|album version)\b[^)\]]*[)\]]/gi, ''));
 // Your hand-sorting wins: a choice for a song beats one for its artist, and both beat the automatic sort.
 // 'skip' leaves the song out. A choice pointing at a playlist you switched off falls back to the automatic sort.
 function manualFor(t, manual) {
@@ -581,7 +585,11 @@ function buildPlan(lib, { unsortedToPop, off, split, splitAt, skipSrc, manual, l
   const buckets = BUCKETS.map(b => ({ ...b, tracks: [] }));
   const unsorted = [], skipped = []; let viaGenre = 0, byHand = 0;
   const where = new Map(); // song id → { key, by }
-  const chosen = lib.tracks.filter(t => !t.src || t.src.some(s => !skipSrc.has(s)));
+  // One playlist per song: other versions of the same song (single vs album, remaster) count as one.
+  const seenSong = new Set(); let dupes = 0;
+  const chosen = lib.tracks.filter(t => !t.src || t.src.some(s => !skipSrc.has(s))).filter(t => {
+    const k = songKey(t); if (seenSong.has(k)) { dupes++; return false; } seenSong.add(k); return true;
+  });
   for (const t of chosen) {
     const m = manualFor(t, manual);
     if (m && m.key === 'skip') { skipped.push(t); byHand++; where.set(t.id, m); continue; }
@@ -605,7 +613,7 @@ function buildPlan(lib, { unsortedToPop, off, split, splitAt, skipSrc, manual, l
   for (const b of buckets) if (b.combined && mergeNames[b.key]) b.name = mergeNames[b.key];
   const final = buckets.filter(b => !off.has(b.key) && !b.mergedInto && b.tracks.length)
     .flatMap(b => split && b.tracks.length > splitAt ? splitByDecade(b) : [b]);
-  return { buckets, final, unsorted, skipped, viaGenre, byHand, where, chosenTracks: chosen, chosen: chosen.length - skipped.length };
+  return { buckets, final, unsorted, skipped, viaGenre, byHand, where, dupes, chosenTracks: chosen, chosen: chosen.length - skipped.length };
 }
 
 /* ---------- Automation and undo ---------- */
@@ -852,6 +860,10 @@ function App() {
   const [mergeNames, setMergeNames] = useState(() => store.get('cs.mergeNames', {}));
   useEffect(() => { store.set('cs.merges', merges); store.set('cs.mergeNames', mergeNames); }, [merges, mergeNames]);
   const [combining, setCombining] = useState(null);
+  const [hidden, setHidden] = useState(() => new Set(store.get('cs.hidden', [])));
+  useEffect(() => { store.set('cs.hidden', [...hidden]); }, [hidden]);
+  const [removing, setRemoving] = useState(false);
+  const offAll = useMemo(() => new Set([...off, ...hidden]), [off, hidden]);
   useEffect(() => { store.set('cs.lfmKey', lfmKey.trim()); }, [lfmKey]);
   useEffect(() => { store.set('cs.manual', manual); }, [manual]);
   const [askRescan, setAskRescan] = useState(false);
@@ -890,7 +902,12 @@ function App() {
     const until = new Date(Date.now() + s * 1000).toLocaleTimeString([], { hour: '2-digit', minute: '2-digit', second: '2-digit' });
     push(`${why === 'limit' ? 'Spotify asked us to slow down' : why === 'saved' ? 'Still inside the wait Spotify asked for' : 'Connection dropped (often a rate limit)'}. Waiting ${s >= 120 ? Math.round(s / 60) + ' min' : s + 's'}, until ${until}, then carrying on. Keep this page open.`, 'err');
   }), [clientId]);
-  const plan = useMemo(() => { applyCustom(custom); return lib && buildPlan(lib, { unsortedToPop, off, split, splitAt, skipSrc, manual, lfm, merges, mergeNames }); }, [lib, unsortedToPop, off, split, skipSrc, manual, lfm, custom, merges, mergeNames]);
+  const plan = useMemo(() => { applyCustom(custom); return lib && buildPlan(lib, { unsortedToPop, off: offAll, split, splitAt, skipSrc, manual, lfm, merges, mergeNames }); }, [lib, unsortedToPop, offAll, split, skipSrc, manual, lfm, custom, merges, mergeNames]);
+  const removeBucket = b => {
+    if (b.custom) setCustom(list => list.filter(c => c.key !== b.key));
+    else setHidden(h => new Set([...h, b.key]));
+    setMerges(ms => ms.filter(m => m.from !== b.key && m.into !== b.key));
+  };
   const makeGenre = tag => setCustom(list => [...list, { key: 'my' + Date.now().toString(36), name: tag.replace(/(^|[\s-])\S/g, c => c.toUpperCase()).replace(/^J Pop$|^K Pop$/i, x => x.replace(' ', '-')), words: [tag], hue: Math.floor(Math.random() * 360) }]);
   useEffect(() => { store.set('cs.off', [...off]); store.set('cs.split', split); }, [off, split]);
 
@@ -1024,6 +1041,7 @@ function App() {
       `Saved library: ${saved ? `${saved.tracks.length} songs, ${saved.playlists.length} playlists, read ${new Date(saved.at).toISOString()}, format ${saved.v || 1}` : 'none'}`,
       `Sources skipped: ${skipSrc.size ? [...skipSrc].join(',') : 'none'}`,
       `Last.fm: key ${lfmKey ? 'set' : 'not set'}, ${Object.keys(lfm.a).length} artists and ${Object.keys(lfm.t).length} songs tagged${NATIVE ? `, native ${NATIVE.lfmKey ? 'yes' : 'no'}` : ''}`,
+      `Removed: ${[...hidden].join(',') || 'none'} · same-song versions merged: ${plan?.dupes ?? 0}`,
       `Combined: ${merges.map(m => `${m.from}→${m.into}`).join(', ') || 'none'}`,
       `Own playlists: ${custom.map(c => `${c.name} [${c.words.join('|')}]`).join(', ') || 'none'}`,
       `Hand-sorted: ${Object.keys(manual.songs).length} songs, ${Object.keys(manual.artists).length} artists set; ${plan ? `${plan.byHand} songs placed by hand, ${plan.skipped.length} left out` : 'no plan'}`,
@@ -1175,9 +1193,16 @@ function App() {
           )}
 
           <Panel className="flex flex-col gap-3">
-            <div className="flex items-baseline justify-between gap-2"><h2 className="text-lg font-bold">New playlists</h2><span className="text-sm text-muted num">{plan.final.length} will be created</span></div>
+            <div className="flex items-center justify-between gap-2">
+              <h2 className="text-lg font-bold">New playlists</h2>
+              <span className="flex items-center gap-2 text-sm text-muted num">{plan.final.length} will be created
+                <button className={'rounded-lg border px-2.5 py-1 ' + (removing ? 'border-accent text-accent font-semibold' : 'border-line')} onClick={() => setRemoving(r => !r)}>{removing ? 'Done' : 'Remove…'}</button>
+              </span>
+            </div>
+            <p className="text-xs text-muted -mt-2">Every song goes into exactly one playlist.{plan.dupes ? ` ${plural(plan.dupes, 'other version')} of songs you already have (like a single and its album version) ${plan.dupes === 1 ? 'is' : 'are'} counted once.` : ''}</p>
+            {removing && <p className="text-sm text-warn">Tap Remove on the playlists you don't want. Their songs go to the next-best match.</p>}
             <ul className="flex flex-col divide-y divide-[var(--line)]">
-              {plan.buckets.map(b => (
+              {plan.buckets.filter(b => !hidden.has(b.key)).map(b => (
                 <li key={b.key} className={'py-2 flex items-start gap-3 ' + (off.has(b.key) ? 'opacity-50' : '')}>
                   <input id={'on' + b.key} type="checkbox" aria-label={'Create ' + b.name} className="mt-1.5 h-4 w-4 accent-[var(--accent)]" checked={!off.has(b.key)}
                     onChange={e => setOff(s => { const n = new Set(s); e.target.checked ? n.delete(b.key) : n.add(b.key); return n; })} />
@@ -1195,7 +1220,9 @@ function App() {
                       onClick={e => { e.stopPropagation(); setEditing(custom.find(c => c.key === b.key)); }}>Edit</span>}
                     {b.mergedInto && <span role="button" tabIndex={0} className="rounded-md border border-line px-2 py-0.5 text-xs text-muted"
                       onClick={e => { e.stopPropagation(); setMerges(ms => ms.filter(m => m.from !== b.key)); }}>Separate</span>}
-                    <Icon name="chevron" className={'w-4 h-4 text-muted transition ' + (openBucket === b.key ? 'rotate-180' : '')} />
+                    {removing
+                      ? <span role="button" tabIndex={0} className="rounded-md border border-danger px-2 py-0.5 text-xs font-semibold text-danger" onClick={e => { e.stopPropagation(); removeBucket(b); }}>Remove</span>
+                      : <Icon name="chevron" className={'w-4 h-4 text-muted transition ' + (openBucket === b.key ? 'rotate-180' : '')} />}
                   </button>
                   {openBucket === b.key && b.tracks.length > 0 && (
                     <ul className="mt-2 max-h-56 overflow-y-auto rounded-lg bg-bg p-2 text-sm">
@@ -1206,12 +1233,13 @@ function App() {
                 </li>
               ))}
             </ul>
+            {hidden.size > 0 && <button className="self-start text-sm text-muted underline" onClick={() => setHidden(new Set())}>Bring back removed playlists ({[...hidden].map(k => BASE_BUCKETS.find(b => b.key === k)?.name).filter(Boolean).join(', ')})</button>}
             {editing ? (
               <CustomEditor item={editing} onCancel={() => setEditing(null)}
                 onSave={c => { setCustom(list => list.some(x => x.key === c.key) ? list.map(x => x.key === c.key ? c : x) : [...list, c]); setEditing(null); }}
                 onDelete={c => { setCustom(list => list.filter(x => x.key !== c.key)); setEditing(null); }} />
             ) : combining ? (
-              <CombineForm buckets={plan.buckets.filter(b => !off.has(b.key) && !b.mergedInto)} onCancel={() => setCombining(null)}
+              <CombineForm buckets={plan.buckets.filter(b => !offAll.has(b.key) && !b.mergedInto)} onCancel={() => setCombining(null)}
                 onSave={(a, b, name) => {
                   setMerges(ms => [...ms.filter(m => m.from !== b), { from: b, into: a }]);
                   setMergeNames(n => ({ ...n, [a]: name }));
@@ -1270,7 +1298,7 @@ function App() {
       )}
 
       {view === 'sorter' && plan && (
-        <HandSorter plan={plan} off={new Set([...off, ...plan.buckets.filter(b => b.mergedInto).map(b => b.key)])} manual={manual} setManual={setManual} lfm={lfm} onDone={() => { setView('dashboard'); window.scrollTo(0, 0); }} />
+        <HandSorter plan={plan} off={new Set([...offAll, ...plan.buckets.filter(b => b.mergedInto).map(b => b.key)])} manual={manual} setManual={setManual} lfm={lfm} onDone={() => { setView('dashboard'); window.scrollTo(0, 0); }} />
       )}
 
       {view === 'running' && (
@@ -1607,7 +1635,9 @@ function GenrePanel({ plan, lib, lfm, custom, onMake }) {
     for (const t of plan.chosenTracks) {
       const a = t.artists[0];
       const tags = new Set([...(lib.genres?.[a?.id] || []), ...(lfm.a[a?.id]?.tags || []), ...(lfm.t[t.id] || [])].map(norm));
-      const k = plan.where.get(t.id)?.key;
+      const w = plan.where.get(t.id), k = w?.key;
+      // Songs already in one of your own playlists, or placed by hand, are sorted out: they don't count.
+      if (!w || w.by === 'song' || w.by === 'artist' || w.key === 'skip' || plan.buckets.find(b => b.key === k)?.custom) continue;
       for (const tag of tags) {
         if (!tag || VAGUE.has(tag) || MOODS.has(tag) || taken.has(tag) || /^\d+s?$/.test(tag)) continue;
         count[tag] = (count[tag] || 0) + 1;
@@ -1625,7 +1655,7 @@ function GenrePanel({ plan, lib, lfm, custom, onMake }) {
   return (
     <Panel className="flex flex-col gap-2">
       <div className="flex items-center gap-2"><Icon name="list" className="w-5 h-5 text-accent" /><h2 className="text-lg font-bold">Biggest genres in your library</h2></div>
-      <p className="text-sm text-muted">Give a genre its own playlist and its songs move there. It shows up in “New playlists”, where you can edit it or combine it with another.</p>
+      <p className="text-sm text-muted">Counts only songs not yet in one of your own playlists or sorted by hand, so it updates as you go. Give a genre its own playlist and its songs move there. It shows up in “New playlists”, where you can edit it or combine it with another.</p>
       <ul className="flex flex-col divide-y divide-[var(--line)]">
         {shown.map(r => (
           <li key={r.tag} className="flex items-center gap-3 py-2">
