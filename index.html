@@ -101,16 +101,17 @@ const REDIRECT = location.origin + location.pathname;
 const API = 'https://api.spotify.com/v1';
 const MIN_GAP = 600; // ms between Spotify requests. Slow on purpose: fewer bursts, fewer 429s.
 const IN_PREVIEW = (() => { try { return window.self !== window.top; } catch { return true; } })();
-const APP_VERSION = '2026-10-31.1';
+const APP_VERSION = '2026-10-31.2';
 try { localStorage.removeItem('cs.genres'); } catch {}
 
-// Ten buckets. kw = words matched against artist genres, title = words matched against song/album names.
-const BUCKETS = [
+// Ten built-in buckets, plus any you add yourself (appended by applyCustom).
+// kw = words matched against artist and song tags, title = words matched against song/album names.
+const BASE_BUCKETS = [
   { key: 'chill', name: 'Chill', hue: 185, blurb: 'Lo-fi, downtempo, dream pop',
     kw: ['chill', 'lo-fi', 'lofi', 'chillhop', 'jazz hop', 'downtempo', 'trip hop', 'bedroom pop', 'dream pop', 'chillwave', 'sleep', 'lounge', 'bossa nova', 'chillout', 'relaxing', 'mellow', 'calm', 'soothing'],
     title: ['lofi', 'lo-fi', 'chill', 'sleep', 'rain', 'calm', 'slowed'] },
   { key: 'energy', name: 'High Energy', hue: 0, blurb: 'Metal, punk, drum & bass, phonk',
-    kw: ['metal', 'punk', 'hardcore', 'hardstyle', 'drum and bass', 'dnb', 'grime', 'drill', 'phonk', 'big room', 'hyperpop', 'thrash', 'nu metal', 'metalcore', 'energetic', 'aggressive', 'workout', 'intense'],
+    kw: ['metal', 'punk', 'hardcore', 'hardstyle', 'drum and bass', 'dnb', 'grime', 'drill', 'phonk', 'big room', 'hyperpop', 'thrash', 'nu metal', 'metalcore', 'energetic', 'aggressive', 'workout', 'intense', 'deathcore', 'death metal', 'djent', 'post-hardcore', 'screamo', 'grindcore', 'slam', 'beatdown', 'crossover thrash'],
     title: ['workout', 'hype', 'rage', 'sped up'] },
   { key: 'acoustic', name: 'Acoustic', hue: 30, blurb: 'Folk, country, singer-songwriter',
     kw: ['folk', 'acoustic', 'singer-songwriter', 'country', 'bluegrass', 'americana', 'indie folk', 'folk rock', 'acoustic guitar'],
@@ -122,7 +123,7 @@ const BUCKETS = [
     kw: ['house', 'techno', 'electro', 'edm', 'trance', 'dubstep', 'electronic', 'electronica', 'synthwave', 'uk garage', 'idm', 'french house', 'deep house', 'breakbeat'],
     title: ['extended mix', 'club mix', 'vip mix', 'remix'] },
   { key: 'hiphop', name: 'Hip-Hop & R&B', hue: 48, blurb: 'Rap, trap, R&B, soul',
-    kw: ['hip hop', 'rap', 'trap', 'r&b', 'soul', 'neo soul', 'boom bap', 'funk', 'west coast rap', 'alternative r&b', 'gangster rap'],
+    kw: ['hip hop', 'rap', 'trap', 'r&b', 'soul', 'neo soul', 'boom bap', 'funk', 'west coast rap', 'alternative r&b', 'gangster rap', 'hiphop', 'rnb', 'underground hip hop', 'conscious hip hop', 'christian hip hop', 'grime', 'emo rap', 'cloud rap'],
     title: ['freestyle', 'cypher'] },
   { key: 'rock', name: 'Rock & Alt', hue: 340, blurb: 'Indie, alternative, grunge',
     kw: ['rock', 'alternative', 'indie', 'grunge', 'shoegaze', 'emo', 'garage rock', 'britpop', 'post-punk', 'new wave', 'indie rock'],
@@ -137,7 +138,14 @@ const BUCKETS = [
     kw: ['classic rock', 'oldies', 'motown', 'classic soul', 'disco', 'doo-wop', 'rock-and-roll', 'yacht rock', 'soft rock', '80s', '70s', '60s'],
     title: ['remaster'] },
 ];
+const BUCKETS = [...BASE_BUCKETS];
 const POP = BUCKETS.findIndex(b => b.key === 'pop');
+// Your own playlists: a name and words to match against tags or artist names. They count double, so they win ties.
+function applyCustom(list) {
+  BUCKETS.length = BASE_BUCKETS.length;
+  for (const c of list || []) BUCKETS.push({ key: c.key, name: c.name, hue: c.hue, blurb: c.words.join(', ') || 'Sorted by hand', kw: c.words, title: [], weight: 2, custom: true });
+}
+try { applyCustom(JSON.parse(localStorage.getItem('cs.custom') || '[]')); } catch {}
 const dot = h => `hsl(${h} 62% 48%)`;
 const tint = h => `hsl(${h} 60% 50% / 0.14)`;
 
@@ -517,20 +525,33 @@ async function loadLibrary(api, { includeOwn, lookupGenres, refresh }, log) {
 }
 
 /* ---------- Classification ---------- */
+// "Hip-Hop", "hip_hop" and "hip hop" are the same tag: compare without case, dashes or underscores.
+// Mood words describe a feeling, not a style, so a "mellow" tag can't outvote a "hip hop" one.
+const MOODS = new Set(['chill', 'chillout', 'relaxing', 'mellow', 'calm', 'soothing', 'sleep', 'energetic', 'aggressive', 'workout', 'intense', 'study']);
+const norm = s => String(s).toLowerCase().replace(/[-_]+/g, ' ').replace(/\s+/g, ' ').trim();
 function classify(track, genres, lfm) {
   // Artist genres from MusicBrainz and Last.fm, plus the song's own Last.fm tags, which count for more.
-  const g = [...new Set(track.artists.flatMap(a => [...(genres[a.id] || []), ...(lfm?.a?.[a.id]?.tags || [])]).map(s => s.toLowerCase()))];
-  const own = lfm?.t?.[track.id] || [];
+  const g = [...new Set(track.artists.flatMap(a => [...(genres[a.id] || []), ...(lfm?.a?.[a.id]?.tags || [])]).map(norm))];
+  const own = (lfm?.t?.[track.id] || []).map(norm);
+  const names = track.artists.map(a => norm(a.name));
   const text = (track.name + ' ' + track.album).toLowerCase();
-  const ranked = BUCKETS.map((b, i) => {
-    let s = 0;
-    for (const gen of g) for (const k of b.kw) if (gen === k || matchWord(gen, k)) s += b.weight || 1;
-    for (const gen of own) for (const k of b.kw) if (gen === k || matchWord(gen, k)) s += 1.5 * (b.weight || 1);
-    for (const k of b.title) if (text.includes(k)) s += 0.75;
-    if (b.key === 'throwback' && track.year && track.year < 1990) s += 1.5;
+  const why = {};
+  const scored = BUCKETS.map((b, i) => {
+    let s = 0; const hit = new Set();
+    for (const raw of b.kw) {
+      const k = norm(raw);
+      const m = !b.custom && MOODS.has(k) ? 0.5 : 1;
+      for (const gen of g) if (gen === k || matchWord(gen, k)) { s += m * (b.weight || 1); hit.add(gen); }
+      for (const gen of own) if (gen === k || matchWord(gen, k)) { s += 1.5 * m * (b.weight || 1); hit.add(gen); }
+      if (b.custom && names.includes(k)) { s += 4; hit.add('artist'); }
+    }
+    for (const k of b.title) if (text.includes(k)) { s += 0.75; hit.add('title “' + k + '”'); }
+    if (b.key === 'throwback' && track.year && track.year < 1990) { s += 0.9; hit.add('from ' + track.year); }
+    why[i] = [...hit];
     return [i, s];
-  }).filter(([, s]) => s > 0).sort((x, y) => y[1] - x[1] || x[0] - y[0]).map(([i]) => i);
-  return { ranked, via: g.length || own.length ? 'genre' : 'name' };
+  });
+  const ranked = scored.filter(([, s]) => s > 0).sort((x, y) => y[1] - x[1] || x[0] - y[0]).map(([i]) => i);
+  return { ranked, why, tags: [...new Set([...own, ...g])], via: g.length || own.length ? 'genre' : 'name' };
 }
 
 // Splits one big playlist into decade playlists; decades with few songs share a "Mixed years" playlist.
@@ -567,9 +588,9 @@ function buildPlan(lib, { unsortedToPop, off, split, splitAt, skipSrc, manual, l
     const r = classify(t, lib.genres, lfm);
     // A song whose best match is switched off goes to its next-best match that is still on.
     const idx = r.ranked.find(i => !off.has(BUCKETS[i].key));
-    if (idx !== undefined) { buckets[idx].tracks.push(t); if (r.via === 'genre') viaGenre++; where.set(t.id, { key: BUCKETS[idx].key, by: 'auto' }); }
-    else if (unsortedToPop && !off.has('pop')) { buckets[POP].tracks.push(t); where.set(t.id, { key: 'pop', by: 'none' }); }
-    else { unsorted.push(t); where.set(t.id, { key: null, by: 'none' }); }
+    if (idx !== undefined) { buckets[idx].tracks.push(t); if (r.via === 'genre') viaGenre++; where.set(t.id, { key: BUCKETS[idx].key, by: 'auto', why: r.why[idx], tags: r.tags }); }
+    else if (unsortedToPop && !off.has('pop')) { buckets[POP].tracks.push(t); where.set(t.id, { key: 'pop', by: 'none', why: [], tags: r.tags }); }
+    else { unsorted.push(t); where.set(t.id, { key: null, by: 'none', why: [], tags: r.tags }); }
   }
   const final = buckets.filter(b => !off.has(b.key) && b.tracks.length)
     .flatMap(b => split && b.tracks.length > splitAt ? splitByDecade(b) : [b]);
@@ -813,6 +834,9 @@ function App() {
   const [manual, setManual] = useState(() => store.get('cs.manual', { songs: {}, artists: {} }));
   const [lfm, setLfm] = useState(() => store.get('cs.lfm', { a: {}, t: {} }));
   const [lfmKey, setLfmKey] = useState(() => store.get('cs.lfmKey', ''));
+  const [custom, setCustom] = useState(() => store.get('cs.custom', []));
+  useEffect(() => { store.set('cs.custom', custom); }, [custom]);
+  const [editing, setEditing] = useState(null); // a custom playlist being added or edited
   useEffect(() => { store.set('cs.lfmKey', lfmKey.trim()); }, [lfmKey]);
   useEffect(() => { store.set('cs.manual', manual); }, [manual]);
   const [askRescan, setAskRescan] = useState(false);
@@ -851,7 +875,7 @@ function App() {
     const until = new Date(Date.now() + s * 1000).toLocaleTimeString([], { hour: '2-digit', minute: '2-digit', second: '2-digit' });
     push(`${why === 'limit' ? 'Spotify asked us to slow down' : why === 'saved' ? 'Still inside the wait Spotify asked for' : 'Connection dropped (often a rate limit)'}. Waiting ${s >= 120 ? Math.round(s / 60) + ' min' : s + 's'}, until ${until}, then carrying on. Keep this page open.`, 'err');
   }), [clientId]);
-  const plan = useMemo(() => lib && buildPlan(lib, { unsortedToPop, off, split, splitAt, skipSrc, manual, lfm }), [lib, unsortedToPop, off, split, skipSrc, manual, lfm]);
+  const plan = useMemo(() => { applyCustom(custom); return lib && buildPlan(lib, { unsortedToPop, off, split, splitAt, skipSrc, manual, lfm }); }, [lib, unsortedToPop, off, split, skipSrc, manual, lfm, custom]);
   useEffect(() => { store.set('cs.off', [...off]); store.set('cs.split', split); }, [off, split]);
 
   useEffect(() => { store.set('cs.clientId', clientId.trim()); }, [clientId]);
@@ -984,6 +1008,7 @@ function App() {
       `Saved library: ${saved ? `${saved.tracks.length} songs, ${saved.playlists.length} playlists, read ${new Date(saved.at).toISOString()}, format ${saved.v || 1}` : 'none'}`,
       `Sources skipped: ${skipSrc.size ? [...skipSrc].join(',') : 'none'}`,
       `Last.fm: key ${lfmKey ? 'set' : 'not set'}, ${Object.keys(lfm.a).length} artists and ${Object.keys(lfm.t).length} songs tagged${NATIVE ? `, native ${NATIVE.lfmKey ? 'yes' : 'no'}` : ''}`,
+      `Own playlists: ${custom.map(c => `${c.name} [${c.words.join('|')}]`).join(', ') || 'none'}`,
       `Hand-sorted: ${Object.keys(manual.songs).length} songs, ${Object.keys(manual.artists).length} artists set; ${plan ? `${plan.byHand} songs placed by hand, ${plan.skipped.length} left out` : 'no plan'}`,
       `Liked Songs clearing: ${unlike ? `backup ${unlike.added}/${unlike.backup.length}${unlike.verified ? ' checked' : ''}, removed ${unlike.removed}/${unlike.remove.length}, restored ${unlike.restored || 0}${unlike.demo ? ' (demo)' : ''}` : 'none'}`,
       `MusicBrainz genres saved: ${Object.keys(g).length} (${Object.values(g).filter(v => !v.length).length} with no genres)`,
@@ -1148,6 +1173,8 @@ function App() {
                       {(() => { const parts = plan.final.filter(f => f.parent === b.key); return parts.length ? <span className="block text-xs text-accent">Splits into {parts.map(f => f.name.split(' · ')[1]).join(', ')}</span> : null; })()}
                     </span>
                     <span className="num text-sm font-semibold">{b.tracks.length}</span>
+                    {b.custom && <span role="button" tabIndex={0} className="rounded-md border border-line px-2 py-0.5 text-xs text-muted"
+                      onClick={e => { e.stopPropagation(); setEditing(custom.find(c => c.key === b.key)); }}>Edit</span>}
                     <Icon name="chevron" className={'w-4 h-4 text-muted transition ' + (openBucket === b.key ? 'rotate-180' : '')} />
                   </button>
                   {openBucket === b.key && b.tracks.length > 0 && (
@@ -1159,6 +1186,15 @@ function App() {
                 </li>
               ))}
             </ul>
+            {editing ? (
+              <CustomEditor item={editing} onCancel={() => setEditing(null)}
+                onSave={c => { setCustom(list => list.some(x => x.key === c.key) ? list.map(x => x.key === c.key ? c : x) : [...list, c]); setEditing(null); }}
+                onDelete={c => { setCustom(list => list.filter(x => x.key !== c.key)); setEditing(null); }} />
+            ) : (
+              <Btn kind="ghost" className="w-full py-2" onClick={() => setEditing({ key: 'my' + Date.now().toString(36), name: '', words: [], hue: Math.floor(Math.random() * 360), isNew: true })}>
+                <Icon name="list" />Add your own playlist
+              </Btn>
+            )}
             <Toggle id="split" checked={split} onChange={setSplit} label={`Split playlists over ${splitAt} songs by decade`}
               hint="For example Rock & Alt · 1990s and Rock & Alt · 2010s. Gives you more, smaller playlists." />
             <Toggle id="unsorted" checked={unsortedToPop} onChange={setUnsortedToPop} label="Put songs with no match into Pop"
@@ -1261,6 +1297,10 @@ function App() {
 // Learns from your hand sorting: for each artist you haven't sorted, it looks at
 // (1) Last.fm's similar artists you have sorted, in either direction, and
 // (2) how well the artist's tags match the tags of the artists you put in each playlist.
+// Tags that say nothing about the sound, so they never drive a suggestion.
+const VAGUE = new Set(['seen live', 'favorites', 'favourites', 'favorite', 'favourite', 'love', 'awesome', 'beautiful', 'cool', 'good', 'best', 'amazing',
+  'male vocalists', 'female vocalists', 'male vocalist', 'female vocalist', 'american', 'british', 'usa', 'uk', 'english', 'canadian', 'australian', 'german', 'french', 'swedish',
+  'spotify', 'all', 'under 2000 listeners', 'my favorite', 'favorite songs', 'loved', 'albums i own', '00s', '10s', '2010s', '2020s', 'new', 'singer', 'band', 'music']);
 function suggestArtists(plan, manual, lfm, off) {
   const handKey = new Map(); // artist id → playlist you chose, by artist or by most of its songs
   const songVotes = {};
@@ -1275,7 +1315,11 @@ function suggestArtists(plan, manual, lfm, off) {
   const names = new Map(), byName = new Map();
   for (const t of plan.chosenTracks) { const a = t.artists[0]; if (a) { names.set(a.id, a.name); byName.set(a.name.toLowerCase(), a.id); } }
   const profile = {}; // playlist → tag weights
-  for (const [id, k] of handKey) for (const tag of lfm.a[id]?.tags || []) ((profile[k] ||= {})[tag] = (profile[k][tag] || 0) + 1);
+  const good = tag => !VAGUE.has(norm(tag));
+  for (const [id, k] of handKey) for (const tag of (lfm.a[id]?.tags || []).filter(good)) ((profile[k] ||= {})[norm(tag)] = (profile[k][norm(tag)] || 0) + 1);
+  // A tag found in several of your playlists doesn't tell them apart, so it counts less.
+  const spread = {};
+  for (const prof of Object.values(profile)) for (const tag of Object.keys(prof)) spread[tag] = (spread[tag] || 0) + 1;
   const simOf = id => (lfm.a[id]?.sim || []).map(n => byName.get(n.toLowerCase())).filter(Boolean);
   const reverse = new Map();
   for (const [id] of handKey) for (const other of simOf(id)) (reverse.get(other) || reverse.set(other, []).get(other)).push(id);
@@ -1288,15 +1332,19 @@ function suggestArtists(plan, manual, lfm, off) {
       const k = handKey.get(other); if (!k || off.has(k)) continue;
       score[k] = (score[k] || 0) + 2; (why[k] ||= new Set()).add(names.get(other));
     }
-    const tags = lfm.a[id]?.tags || [];
+    const tags = (lfm.a[id]?.tags || []).filter(good).map(norm);
     if (tags.length) for (const [k, prof] of Object.entries(profile)) {
       if (off.has(k)) continue;
+      const shared = tags.filter(tag => prof[tag]);
+      if (shared.length < 2) continue; // one shared tag is too thin to go on
       const total = Object.values(prof).reduce((n, x) => n + x, 0);
-      const hit = tags.reduce((n, tag) => n + (prof[tag] || 0), 0) / total;
-      if (hit > 0) score[k] = (score[k] || 0) + Math.min(1.5, hit * 4);
+      const hit = shared.reduce((n, tag) => n + prof[tag] / spread[tag], 0) / total;
+      score[k] = (score[k] || 0) + Math.min(1.5, hit * 4);
+      (why[k] ||= new Set());
+      if (!why[k].size) why[k].tags = shared.slice(0, 3);
     }
     const best = Object.entries(score).sort((x, y) => y[1] - x[1])[0];
-    if (best && best[1] >= 1) list.push({ id, name, key: best[0], score: best[1], like: [...(why[best[0]] || [])].slice(0, 2) });
+    if (best && best[1] >= 1) list.push({ id, name, key: best[0], score: best[1], like: [...(why[best[0]] || [])].slice(0, 2), tags: why[best[0]]?.tags || [] });
   }
   return { ready: true, list: list.sort((x, y) => y.score - x.score) };
 }
@@ -1425,7 +1473,7 @@ function HandSorter({ plan, off, manual, setManual, lfm, onDone }) {
                     <span className="block truncate text-sm font-medium">{x.name}</span>
                     <span className="flex items-center gap-1 text-xs text-muted">
                       <span className="h-2.5 w-2.5 shrink-0 rounded-full" style={{ background: dot(hueOf(x.key)) }} />
-                      <span className="truncate">{nameOf(x.key)}{x.like.length ? `, like ${x.like.join(' and ')}` : ', by tags'} · {plural(songsOf[x.id] || 0, 'song')}</span>
+                      <span className="truncate">{nameOf(x.key)}{x.like.length ? `, like ${x.like.join(' and ')}` : x.tags.length ? `, tags: ${x.tags.join(', ')}` : ''} · {plural(songsOf[x.id] || 0, 'song')}</span>
                     </span>
                   </span>
                   <button className="shrink-0 rounded-lg border border-line px-2.5 py-1.5 text-sm" onClick={() => { setMode('artists'); setQ(x.name); setOpen(x.id); }}>Other</button>
@@ -1450,6 +1498,10 @@ function HandSorter({ plan, off, manual, setManual, lfm, onDone }) {
                 <span className="min-w-0 flex-1">
                   <span className="block truncate text-sm font-medium">{t.name}</span>
                   <span className="block truncate text-xs text-muted">{t.artists.map(a => a.name).join(', ')}{t.year ? ` · ${t.year}` : ''}</span>
+                  <span className="block truncate text-[11px] text-muted">
+                    {w.by === 'song' ? 'Your choice' : w.by === 'artist' ? 'Your choice for this artist'
+                      : w.why?.length ? 'Matched: ' + w.why.join(', ') : w.tags?.length ? 'No match. Tags: ' + w.tags.slice(0, 5).join(', ') : 'No tags found'}
+                  </span>
                 </span>
                 <Badge k={w.key} by={w.by} />
               </button>
@@ -1485,6 +1537,30 @@ function HandSorter({ plan, off, manual, setManual, lfm, onDone }) {
       ) : (
         <button className="text-sm text-muted underline self-center" onClick={() => setConfirmReset(true)}>Clear all my choices ({handCount})</button>
       ))}
+    </div>
+  );
+}
+
+function CustomEditor({ item, onSave, onCancel, onDelete }) {
+  const [name, setName] = useState(item.name);
+  const [words, setWords] = useState(item.words.join(', '));
+  const [sure, setSure] = useState(false);
+  const list = words.split(',').map(w => w.trim().toLowerCase()).filter(Boolean);
+  return (
+    <div className="flex flex-col gap-2 rounded-xl border border-accent p-3">
+      <h3 className="font-bold">{item.isNew ? 'Your own playlist' : 'Edit ‘' + item.name + '’'}</h3>
+      <label htmlFor="cname" className="text-sm">Name</label>
+      <input id="cname" value={name} onChange={e => setName(e.target.value)} placeholder="For example Deathcore, or J-Pop Chill" className="rounded-lg border border-line bg-bg px-3 py-2 text-base" />
+      <label htmlFor="cwords" className="text-sm">Words to match, separated by commas</label>
+      <input id="cwords" value={words} onChange={e => setWords(e.target.value)} placeholder="deathcore, slam, Bodysnatcher" autoCapitalize="off" className="rounded-lg border border-line bg-bg px-3 py-2 text-base" />
+      <p className="text-xs text-muted">Genres, moods or artist names. A song goes here when its tags or artist match, and these count double, so they win over the built-in playlists. Leave it empty to fill it only by hand in “Sort by hand”.</p>
+      <div className="grid grid-cols-2 gap-2">
+        <Btn kind="ghost" className="py-2" onClick={onCancel}>Cancel</Btn>
+        <Btn className="py-2" disabled={!name.trim()} onClick={() => onSave({ key: item.key, name: name.trim(), words: list, hue: item.hue })}><Icon name="check" />Save</Btn>
+      </div>
+      {!item.isNew && (sure
+        ? <Btn kind="danger" className="py-2" onClick={() => onDelete(item)}>Yes, remove ‘{item.name}’</Btn>
+        : <button className="self-start text-sm text-muted underline" onClick={() => setSure(true)}>Remove this playlist</button>)}
     </div>
   );
 }
