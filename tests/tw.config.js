@@ -1,0 +1,1 @@
+module.exports={content:['../index.html'],theme:{extend:{colors:{bg:'var(--bg)',surface:'var(--surface)',line:'var(--line)',fg:'var(--fg)',muted:'var(--muted)',accent:'var(--accent)','accent-fg':'var(--accent-fg)',warn:'var(--warn)',ok:'var(--ok)',danger:'var(--danger)'},fontFamily:{display:'var(--font-display)',body:'var(--font-body)',mono:'var(--font-mono)'}}}};

@@ -1,0 +1,13 @@
+{
+  "private": true,
+  "scripts": {
+    "css": "tailwindcss -c tw.config.js -i in.css -o tw.css",
+    "test": "npm run css && node demo.js && node spotify.js"
+  },
+  "dependencies": {
+    "@babel/standalone": "^7.23.5",
+    "react": "^18.3.1",
+    "react-dom": "^18.3.1",
+    "tailwindcss": "^3.4.17"
+  }
+}
